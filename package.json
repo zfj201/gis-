@@ -1,0 +1,16 @@
+{
+  "name": "gis-semantic-query",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "backend",
+    "frontend",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "npm run build -w shared && (npm run dev -w backend & npm run dev -w frontend)",
+    "dev:backend": "npm run build -w shared && npm run dev -w backend",
+    "dev:frontend": "npm run dev -w frontend",
+    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend"
+  }
+}
