@@ -5,18 +5,25 @@ import {
   spatialQueryDslSchema
 } from "@gis/shared";
 import { config } from "./config.js";
+import { layerRegistry } from "./layer-registry.js";
 import {
-  GENERAL_CHAT_SYSTEM_PROMPT,
-  SEMANTIC_FEW_SHOTS,
-  SEMANTIC_SYSTEM_PROMPT
+  buildSemanticFewShots,
+  buildSemanticSystemPrompt,
+  GENERAL_CHAT_SYSTEM_PROMPT
 } from "./prompts/semantic.js";
+import {
+  buildModelFailureDetail,
+  classifyModelFailureReason,
+  normalizeDslByQuestion
+} from "./semantic-normalizer.js";
 import { parseQuestion as parseQuestionByRules } from "./semantic.js";
+import { defaultOutputFields, findCountyField, resolveTargetLayer } from "./semantic-routing.js";
 
 interface LlmSemanticOutput {
   actionable: boolean;
   confidence?: number;
   followUpQuestion?: string | null;
-  dsl?: SpatialQueryDSL;
+  dsl?: SpatialQueryDSL | null;
 }
 
 interface OpenAICompatibleConfig {
@@ -34,8 +41,32 @@ export interface GeneralChatResponse {
   parserSource: ParserSource;
 }
 
+interface OpenAIMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+type SemanticOutputIssueKind = "schema" | "non_json" | "consistency";
+
+interface SemanticCompletionResult {
+  content: string;
+  usedResponseFormat: boolean;
+}
+
+class SemanticOutputError extends Error {
+  kind: SemanticOutputIssueKind;
+  rawOutput: string;
+
+  constructor(kind: SemanticOutputIssueKind, message: string, rawOutput: string) {
+    super(message);
+    this.name = "SemanticOutputError";
+    this.kind = kind;
+    this.rawOutput = rawOutput;
+  }
+}
+
 function hasSpatialSignal(question: string): boolean {
-  return /(公园|区县|县|街道|附近|周边|坐标|经纬|公里|千米|米|统计|查询|查找|地图|点位|范围|最近|缓冲|地址|城市|poi|distance|buffer)/i.test(
+  return /(公园|区县|县|街道|附近|周边|坐标|经纬|公里|千米|米|统计|查询|查找|地图|点位|范围|最近|缓冲|地址|城市|poi|distance|buffer|门牌|道路|房屋|建筑|图层|多少|几个|总数|数量)/i.test(
     question
   );
 }
@@ -45,6 +76,10 @@ function hasCoordinateText(question: string): boolean {
     /-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?/.test(question) ||
     /x\s*[:：]\s*-?\d+(?:\.\d+)?\s*[，,\s]+y\s*[:：]\s*-?\d+(?:\.\d+)?/i.test(question)
   );
+}
+
+function hasSourceBufferText(question: string): boolean {
+  return /(.+?)\s*\d+(?:\.\d+)?\s*(km|公里|千米|m|米)\s*(?:以内|内)\s*的?\s*(.+)/i.test(question);
 }
 
 function isBufferIntentText(question: string): boolean {
@@ -62,37 +97,11 @@ function hasCountyText(question: string): boolean {
 }
 
 function hasCountyFilter(dsl: SpatialQueryDSL): boolean {
-  return dsl.attributeFilter.some((item) => item.field === "区县" && item.operator === "=");
-}
-
-function isModelResultConsistent(question: string, parsed: ParseResponse): boolean {
-  const dsl = parsed.dsl;
-
-  // Explicit coordinate + buffer language must yield executable buffer query.
-  if (hasCoordinateText(question) && isBufferIntentText(question)) {
-    if (
-      dsl.intent !== "buffer_search" ||
-      dsl.spatialFilter?.type !== "buffer" ||
-      !dsl.spatialFilter?.center ||
-      parsed.followUpQuestion
-    ) {
-      return false;
-    }
-  }
-
-  // Count language should not degrade to plain search.
-  if (isCountIntentText(question)) {
-    if (dsl.intent !== "count" && dsl.aggregation?.type !== "count") {
-      return false;
-    }
-  }
-
-  // County text should keep county filter.
-  if (hasCountyText(question) && !hasCountyFilter(dsl)) {
-    return false;
-  }
-
-  return true;
+  return dsl.attributeFilter.some(
+    (item) =>
+      item.operator === "=" &&
+      /(区县|行政区划|县级政区|城市|所在乡镇|乡级政区)/.test(item.field)
+  );
 }
 
 function parseRequestedTopLimit(question: string): number | undefined {
@@ -130,14 +139,29 @@ function isUnconstrainedSearch(dsl: SpatialQueryDSL): boolean {
 }
 
 function createDefaultDsl(): SpatialQueryDSL {
+  const layer = layerRegistry.getDefaultLayer();
+  if (!layer) {
+    return {
+      intent: "search",
+      targetLayer: "fuzhou_parks",
+      attributeFilter: [],
+      aggregation: null,
+      limit: 20,
+      output: {
+        fields: [],
+        returnGeometry: true
+      }
+    };
+  }
+
   return {
     intent: "search",
-    targetLayer: "fuzhou_parks",
+    targetLayer: layer.layerKey,
     attributeFilter: [],
     aggregation: null,
     limit: 20,
     output: {
-      fields: ["fid", "名称", "地址", "区县"],
+      fields: defaultOutputFields(layer),
       returnGeometry: true
     }
   };
@@ -165,6 +189,299 @@ function extractJsonString(raw: string): string {
   return raw.trim();
 }
 
+function normalizeLocationType(raw: unknown): "point" | "road" | "subdistrict" | "county" | "unknown" {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) {
+    return "unknown";
+  }
+  if (value === "point" || value === "poi") {
+    return "point";
+  }
+  if (value === "road" || value === "line" || value === "polyline") {
+    return "road";
+  }
+  if (value === "subdistrict" || value === "polygon" || value === "area") {
+    return "subdistrict";
+  }
+  if (value === "county") {
+    return "county";
+  }
+  return "unknown";
+}
+
+function normalizeIntent(raw: unknown): SpatialQueryDSL["intent"] {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "count") {
+    return "count";
+  }
+  if (value === "group_stat" || value === "group" || value === "group_count" || value === "groupstat") {
+    return "group_stat";
+  }
+  if (value === "nearest") {
+    return "nearest";
+  }
+  if (value === "buffer_search" || value === "buffer" || value === "nearby") {
+    return "buffer_search";
+  }
+  return "search";
+}
+
+function normalizeSpatialType(raw: unknown): "buffer" | "intersects" | "nearest" | undefined {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) {
+    return undefined;
+  }
+  if (value === "buffer" || value === "nearby") {
+    return "buffer";
+  }
+  if (value === "intersects" || value === "intersect") {
+    return "intersects";
+  }
+  if (value === "nearest") {
+    return "nearest";
+  }
+  return undefined;
+}
+
+function normalizeUnit(raw: unknown): "meter" | "kilometer" | undefined {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) {
+    return undefined;
+  }
+  if (value === "kilometer" || value === "km" || value === "公里" || value === "千米") {
+    return "kilometer";
+  }
+  if (value === "meter" || value === "m" || value === "米") {
+    return "meter";
+  }
+  return undefined;
+}
+
+function normalizeOperator(raw: unknown): SpatialQueryDSL["attributeFilter"][number]["operator"] {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (["gte", ">=", "atleast", "min"].includes(value)) {
+    return ">=";
+  }
+  if (["lte", "<=", "atmost", "max"].includes(value)) {
+    return "<=";
+  }
+  if (value === ">" || value === "gt") {
+    return ">";
+  }
+  if (value === "<" || value === "lt") {
+    return "<";
+  }
+  if (value === "like" || value === "contains" || value === "contain") {
+    return "like";
+  }
+  return "=";
+}
+
+function normalizeFilterList(
+  raw: unknown
+): Array<{ field: string; operator: SpatialQueryDSL["attributeFilter"][number]["operator"]; value: string }> {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const field = String((item as { field?: unknown }).field ?? "").trim();
+      const value = String((item as { value?: unknown }).value ?? "").trim();
+      if (!field || !value) {
+        return null;
+      }
+      return {
+        field,
+        operator: normalizeOperator((item as { operator?: unknown }).operator),
+        value
+      };
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        field: string;
+        operator: SpatialQueryDSL["attributeFilter"][number]["operator"];
+        value: string;
+      } => Boolean(item)
+    );
+}
+
+function normalizeLimit(raw: unknown): number {
+  const parsed = Number(raw);
+  if (Number.isNaN(parsed) || parsed <= 0) {
+    return 20;
+  }
+  return Math.min(2000, Math.max(1, Math.round(parsed)));
+}
+
+function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
+  if (!rawDsl || typeof rawDsl !== "object") {
+    throw new Error("模型 dsl 缺失或不是对象");
+  }
+
+  const dsl = rawDsl as Record<string, unknown>;
+  const locationEntity = dsl.locationEntity as Record<string, unknown> | undefined;
+  const spatialFilter = dsl.spatialFilter as Record<string, unknown> | undefined;
+  const output = dsl.output as Record<string, unknown> | undefined;
+
+  const normalized: SpatialQueryDSL = {
+    intent: normalizeIntent(dsl.intent),
+    targetLayer: String(dsl.targetLayer ?? ""),
+    attributeFilter: normalizeFilterList(dsl.attributeFilter),
+    aggregation:
+      dsl.aggregation && typeof dsl.aggregation === "object"
+        ? (dsl.aggregation as SpatialQueryDSL["aggregation"])
+        : null,
+    limit: normalizeLimit(dsl.limit),
+    output: {
+      fields: Array.isArray(output?.fields)
+        ? output!.fields.map((item) => String(item)).filter((item) => item.trim().length > 0)
+        : [],
+      returnGeometry: output?.returnGeometry === undefined ? true : Boolean(output.returnGeometry)
+    }
+  };
+
+  if (locationEntity && typeof locationEntity === "object") {
+    normalized.locationEntity = {
+      rawText:
+        locationEntity.rawText === undefined ? undefined : String(locationEntity.rawText),
+      type: normalizeLocationType(locationEntity.type),
+      resolution:
+        locationEntity.resolution === "resolved" ||
+        locationEntity.resolution === "needs_clarification" ||
+        locationEntity.resolution === "missing_dependency"
+          ? locationEntity.resolution
+          : undefined
+    };
+  }
+
+  if (spatialFilter && typeof spatialFilter === "object") {
+    const radius = Number(spatialFilter.radius);
+    normalized.spatialFilter = {
+      type: normalizeSpatialType(spatialFilter.type),
+      radius: Number.isNaN(radius) ? undefined : radius,
+      unit: normalizeUnit(spatialFilter.unit),
+      ringOnly:
+        spatialFilter.ringOnly === undefined ? undefined : Boolean(spatialFilter.ringOnly),
+      sourceLayer:
+        spatialFilter.sourceLayer === undefined ? undefined : String(spatialFilter.sourceLayer),
+      sourceAttributeFilter: normalizeFilterList(spatialFilter.sourceAttributeFilter),
+      center:
+        spatialFilter.center && typeof spatialFilter.center === "object"
+          ? (spatialFilter.center as any)
+          : undefined
+    };
+  }
+
+  return normalized;
+}
+
+function normalizeDslForSchemaAndParse(dsl: unknown): SpatialQueryDSL {
+  const normalized = normalizeDslForSchema(dsl);
+  return spatialQueryDslSchema.parse(normalized);
+}
+
+function normalizeDslForSchemaLegacy(dsl: SpatialQueryDSL): SpatialQueryDSL {
+  if (!dsl.locationEntity) {
+    return dsl;
+  }
+  return {
+    ...dsl,
+    locationEntity: {
+      ...dsl.locationEntity,
+      type: normalizeLocationType(dsl.locationEntity.type)
+    }
+  };
+}
+
+function applyLayerRouting(question: string, dsl: SpatialQueryDSL): ParseResponse {
+  const resolved = resolveTargetLayer(question, dsl.targetLayer);
+  if (!resolved.layer) {
+    return {
+      dsl: createDefaultDsl(),
+      confidence: 0.6,
+      followUpQuestion:
+        resolved.followUpQuestion ?? "无法识别目标图层，请指定图层后重试。",
+      parserSource: "rule"
+    };
+  }
+
+  const fixedDsl: SpatialQueryDSL = {
+    ...dsl,
+    targetLayer: resolved.layer.layerKey,
+    output: {
+      ...dsl.output,
+      fields: dsl.output.fields.length ? dsl.output.fields : defaultOutputFields(resolved.layer)
+    }
+  };
+
+  if (
+    (fixedDsl.intent === "group_stat" || fixedDsl.aggregation?.type === "group_count") &&
+    (!fixedDsl.aggregation?.groupBy || fixedDsl.aggregation.groupBy.length === 0)
+  ) {
+    const groupField = findCountyField(resolved.layer);
+    if (groupField) {
+      fixedDsl.aggregation = {
+        type: "group_count",
+        groupBy: [groupField]
+      };
+      fixedDsl.sort = {
+        by: groupField,
+        order: "asc"
+      };
+    }
+  }
+
+  return {
+    dsl: fixedDsl,
+    confidence: 0.9,
+    followUpQuestion: resolved.followUpQuestion,
+    parserSource: "rule"
+  };
+}
+
+function isModelResultConsistent(question: string, parsed: ParseResponse): boolean {
+  const dsl = parsed.dsl;
+
+  if (hasCoordinateText(question) && isBufferIntentText(question)) {
+    if (
+      dsl.intent !== "buffer_search" ||
+      dsl.spatialFilter?.type !== "buffer" ||
+      !dsl.spatialFilter?.center ||
+      parsed.followUpQuestion
+    ) {
+      return false;
+    }
+  }
+
+  if (hasSourceBufferText(question) && !hasCoordinateText(question)) {
+    if (
+      dsl.intent !== "buffer_search" ||
+      dsl.spatialFilter?.type !== "buffer" ||
+      !dsl.spatialFilter?.sourceLayer ||
+      !dsl.spatialFilter?.sourceAttributeFilter?.length
+    ) {
+      return false;
+    }
+  }
+
+  if (isCountIntentText(question)) {
+    if (dsl.intent !== "count" && dsl.aggregation?.type !== "count") {
+      return false;
+    }
+  }
+
+  if (hasCountyText(question) && !hasCountyFilter(dsl)) {
+    return false;
+  }
+
+  return true;
+}
+
 function normalizeModelOutput(
   question: string,
   output: LlmSemanticOutput,
@@ -185,10 +502,9 @@ function normalizeModelOutput(
     throw new Error("LLM 返回 actionable=true 但缺少 dsl");
   }
 
-  const parsed = spatialQueryDslSchema.parse(output.dsl);
-
-  // Safety gate: avoid executing broad table scan for non-spatial chit-chat.
-  if (isUnconstrainedSearch(parsed) && !hasSpatialSignal(question)) {
+  const parsed = normalizeDslForSchemaAndParse(output.dsl);
+  const parsedWithLegacy = normalizeDslForSchemaLegacy(parsed);
+  if (isUnconstrainedSearch(parsedWithLegacy) && !hasSpatialSignal(question)) {
     return {
       dsl: createDefaultDsl(),
       confidence: 0.4,
@@ -198,13 +514,15 @@ function normalizeModelOutput(
     };
   }
 
-  const normalizedDsl = normalizeLimitByQuestion(question, parsed);
-
+  const normalizedDsl = normalizeLimitByQuestion(question, parsedWithLegacy);
+  const routed = applyLayerRouting(question, normalizedDsl);
+  const normalizedByRule = normalizeDslByQuestion(question, routed.dsl);
   return {
-    dsl: normalizedDsl,
+    dsl: normalizedByRule.dsl,
     confidence: clampConfidence(output.confidence),
-    followUpQuestion: output.followUpQuestion ?? null,
-    parserSource
+    followUpQuestion: output.followUpQuestion ?? routed.followUpQuestion ?? null,
+    parserSource,
+    normalizedByRule: normalizedByRule.normalized
   };
 }
 
@@ -222,6 +540,150 @@ function providerToSource(provider: string): ParserSource {
   return "rule";
 }
 
+function isResponseFormatUnsupported(statusCode: number, responseText: string): boolean {
+  if (![400, 404, 415, 422].includes(statusCode)) {
+    return false;
+  }
+  return /(response_format|json_object|unsupported|not supported|invalid.*response_format)/i.test(responseText);
+}
+
+function isRepairableSemanticError(error: unknown): error is SemanticOutputError {
+  return (
+    error instanceof SemanticOutputError &&
+    (error.kind === "schema" || error.kind === "non_json" || error.kind === "consistency")
+  );
+}
+
+function buildSemanticRepairPrompt(question: string, issue: SemanticOutputError): string {
+  const outputPreview = issue.rawOutput.slice(0, 1600);
+  return [
+    "你上一条输出不合规，请修正。",
+    "要求：只返回 JSON 对象，不要解释，不要 markdown。",
+    "顶层键必须是：actionable, confidence, followUpQuestion, dsl。",
+    "修正原因：" + issue.message,
+    "原问题：" + question,
+    "上一条输出（截断）：" + outputPreview
+  ].join("\n");
+}
+
+function buildSemanticMessages(
+  semanticSystemPrompt: string,
+  semanticFewShots: OpenAIMessage[],
+  question: string
+): OpenAIMessage[] {
+  return [{ role: "system", content: semanticSystemPrompt }, ...semanticFewShots, { role: "user", content: question }];
+}
+
+async function requestSemanticCompletion(
+  provider: OpenAICompatibleConfig,
+  messages: OpenAIMessage[],
+  preferJsonFormat: boolean
+): Promise<SemanticCompletionResult> {
+  let lastError: unknown = null;
+  let useResponseFormat = preferJsonFormat;
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), provider.timeoutMs);
+    try {
+      const requestBody: Record<string, unknown> = {
+        model: provider.model,
+        temperature: 0,
+        messages
+      };
+      if (useResponseFormat) {
+        requestBody.response_format = { type: "json_object" };
+      }
+
+      const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${provider.apiKey}`,
+          ...(provider.extraHeaders ?? {})
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        if (useResponseFormat && isResponseFormatUnsupported(response.status, body)) {
+          useResponseFormat = false;
+          console.warn("[semantic] provider does not support response_format=json_object, retry without it", {
+            provider: provider.providerName,
+            status: response.status
+          });
+          continue;
+        }
+        throw new Error(`${provider.providerName} API 请求失败: ${response.status} ${body}`);
+      }
+
+      const payload = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const content = payload.choices?.[0]?.message?.content;
+      if (!content) {
+        throw new Error(`${provider.providerName} 返回内容为空`);
+      }
+
+      return {
+        content,
+        usedResponseFormat: useResponseFormat
+      };
+    } catch (error) {
+      lastError = error;
+      const message = (error as Error)?.message ?? "";
+      const shouldRetry = attempt < maxAttempts && /aborted|timeout|429|5\d\d/i.test(message);
+      console.warn("[semantic] provider attempt failed", {
+        provider: provider.providerName,
+        attempt,
+        maxAttempts,
+        shouldRetry,
+        reason: message
+      });
+      if (!shouldRetry) {
+        throw error;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("模型请求失败");
+}
+
+function parseSemanticOutputToDsl(
+  question: string,
+  parserSource: "groq" | "openrouter",
+  rawContent: string
+): ParseResponse {
+  const rawJson = extractJsonString(rawContent);
+  let modelOutput: LlmSemanticOutput;
+  try {
+    modelOutput = JSON.parse(rawJson) as LlmSemanticOutput;
+  } catch (error) {
+    throw new SemanticOutputError(
+      "non_json",
+      `模型输出不是合法 JSON：${(error as Error).message}`,
+      rawContent
+    );
+  }
+
+  let parsed: ParseResponse;
+  try {
+    parsed = normalizeModelOutput(question, modelOutput, parserSource);
+  } catch (error) {
+    throw new SemanticOutputError("schema", `模型输出 Schema 校验失败：${(error as Error).message}`, rawJson);
+  }
+
+  if (!isModelResultConsistent(question, parsed)) {
+    throw new SemanticOutputError("consistency", "模型输出与语义一致性规则冲突。", rawJson);
+  }
+  return parsed;
+}
+
 async function parseWithOpenAICompatible(
   question: string,
   provider: OpenAICompatibleConfig
@@ -230,48 +692,49 @@ async function parseWithOpenAICompatible(
     throw new Error(`${provider.providerName.toUpperCase()}_API_KEY 未配置`);
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), provider.timeoutMs);
+  const catalog = layerRegistry.listCatalog();
+  const queryableLayers = catalog.layers.filter((layer) => layer.queryable);
+  const defaultLayerKey = layerRegistry.getDefaultLayer()?.layerKey ?? "fuzhou_parks";
+  const semanticSystemPrompt = buildSemanticSystemPrompt(queryableLayers);
+  const semanticFewShots = buildSemanticFewShots(defaultLayerKey, queryableLayers);
+  const baseMessages = buildSemanticMessages(semanticSystemPrompt, semanticFewShots, question);
+  const first = await requestSemanticCompletion(provider, baseMessages, true);
 
   try {
-    const response = await fetch(`${provider.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${provider.apiKey}`,
-        ...(provider.extraHeaders ?? {})
+    return parseSemanticOutputToDsl(question, provider.parserSource, first.content);
+  } catch (error) {
+    if (!isRepairableSemanticError(error)) {
+      throw error;
+    }
+
+    const repairPrompt = buildSemanticRepairPrompt(question, error);
+    const repairMessages: OpenAIMessage[] = [
+      ...baseMessages,
+      {
+        role: "assistant",
+        content: first.content.slice(0, 2000)
       },
-      body: JSON.stringify({
-        model: provider.model,
-        temperature: 0,
-        messages: [
-          { role: "system", content: SEMANTIC_SYSTEM_PROMPT },
-          ...SEMANTIC_FEW_SHOTS,
-          { role: "user", content: question }
-        ]
-      }),
-      signal: controller.signal
-    });
+      {
+        role: "user",
+        content: repairPrompt
+      }
+    ];
+    const second = await requestSemanticCompletion(
+      provider,
+      repairMessages,
+      first.usedResponseFormat
+    );
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`${provider.providerName} API 请求失败: ${response.status} ${body}`);
+    try {
+      return parseSemanticOutputToDsl(question, provider.parserSource, second.content);
+    } catch (secondError) {
+      if (!isRepairableSemanticError(secondError)) {
+        throw secondError;
+      }
+      throw new Error(
+        `模型二次修复失败: first=${error.kind}; second=${secondError.kind}; ${secondError.message}`
+      );
     }
-
-    const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
-    const content = payload.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error(`${provider.providerName} 返回内容为空`);
-    }
-
-    const rawJson = extractJsonString(content);
-    const modelOutput = JSON.parse(rawJson) as LlmSemanticOutput;
-    return normalizeModelOutput(question, modelOutput, provider.parserSource);
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -350,7 +813,7 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
 
   if (provider === "groq") {
     try {
-      const modelParsed = await parseWithOpenAICompatible(question, {
+      return await parseWithOpenAICompatible(question, {
         providerName: "groq",
         parserSource: "groq",
         apiKey: config.groqApiKey,
@@ -358,20 +821,27 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
         model: config.groqModel,
         timeoutMs: config.groqTimeoutMs
       });
-
-      if (!isModelResultConsistent(question, modelParsed)) {
-        return withParserSource(parseQuestionByRules(question), "rule_fallback");
-      }
-      return modelParsed;
     } catch (error) {
-      console.warn("[semantic] Groq 解析失败，回退规则解析:", (error as Error).message);
-      return withParserSource(parseQuestionByRules(question), "rule_fallback");
+      const reason = classifyModelFailureReason(error);
+      const detail = buildModelFailureDetail(error);
+      console.warn("[semantic] Groq 解析失败，回退规则解析:", {
+        provider: "groq",
+        raw: (error as Error).message,
+        normalizedReason: reason,
+        detail
+      });
+      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      return {
+        ...fallback,
+        parserFailureReason: reason,
+        parserFailureDetail: detail
+      };
     }
   }
 
   if (provider === "openrouter") {
     try {
-      const modelParsed = await parseWithOpenAICompatible(question, {
+      return await parseWithOpenAICompatible(question, {
         providerName: "openrouter",
         parserSource: "openrouter",
         apiKey: config.openrouterApiKey,
@@ -383,14 +853,21 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
           "X-Title": config.openrouterAppName
         }
       });
-
-      if (!isModelResultConsistent(question, modelParsed)) {
-        return withParserSource(parseQuestionByRules(question), "rule_fallback");
-      }
-      return modelParsed;
     } catch (error) {
-      console.warn("[semantic] OpenRouter 解析失败，回退规则解析:", (error as Error).message);
-      return withParserSource(parseQuestionByRules(question), "rule_fallback");
+      const reason = classifyModelFailureReason(error);
+      const detail = buildModelFailureDetail(error);
+      console.warn("[semantic] OpenRouter 解析失败，回退规则解析:", {
+        provider: "openrouter",
+        raw: (error as Error).message,
+        normalizedReason: reason,
+        detail
+      });
+      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      return {
+        ...fallback,
+        parserFailureReason: reason,
+        parserFailureDetail: detail
+      };
     }
   }
 

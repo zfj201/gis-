@@ -24,7 +24,11 @@
 - `POST /api/semantic/parse`
 - `POST /api/spatial/execute`
 - `POST /api/chat/query`
-- `GET /api/layers/meta`
+- `GET /api/layers/catalog`
+- `POST /api/layers/catalog/register`
+- `DELETE /api/layers/catalog/service/:serviceId`
+- `PATCH /api/layers/catalog/layer/:layerKey`
+- `GET /api/layers/meta`（兼容，支持 `layerKey` 查询参数）
 - `GET /health`
 
 ## Quick Start
@@ -57,6 +61,10 @@ npm run dev:frontend
 - `PORT`（默认 `3300`）
 - `HOST`（默认 `0.0.0.0`）
 - `ARCGIS_PARKS_LAYER_URL`（默认福州市公园点图层）
+- `LAYER_REGISTRY_PATH`（图层注册表落盘路径，默认 `backend/data/layer-registry.json`）
+- `LAYER_META_TIMEOUT_MS`（图层元数据请求超时，默认 `8000`）
+- `ALLOWED_LAYER_HOSTS`（允许注册的图层域名白名单，逗号分隔）
+- `MAX_REGISTERED_SERVICES`（最大可注册服务数，默认 `20`）
 - `DEFAULT_RADIUS_METERS`（默认 `5000`）
 - `MAX_RADIUS_METERS`（默认 `0`，`<=0` 表示不限制）
 - `LLM_PROVIDER`（`rule` / `groq` / `openrouter`，默认 `rule`）
@@ -85,5 +93,6 @@ OpenRouter Free 接入步骤：
 
 ## Notes
 
-- 当前 P0 严格依赖公园点图层，不包含道路/区县边界图层能力。
-- 对于“某街道100米内”“某县1km内”会返回补充依赖提示。
+- 支持手动添加多个 `FeatureServer`，自动发现子图层并可显示/隐藏。
+- 语义查询采用“自动图层路由 + 歧义追问”，当前版本一次仅执行单图层查询。
+- 图层配置会持久化到 `backend/data/layer-registry.json`。

@@ -1,9 +1,5 @@
 import type { QueryPlan } from "@gis/shared";
 
-function withQuery(path: string, query: URLSearchParams): string {
-  return `${path}/query?${query.toString()}`;
-}
-
 export async function fetchLayerMeta(layerUrl: string): Promise<Record<string, unknown>> {
   const res = await fetch(`${layerUrl}?f=pjson`);
   if (!res.ok) {
@@ -22,6 +18,10 @@ export async function executeArcgisQuery(plan: QueryPlan): Promise<Record<string
 
   if (plan.resultRecordCount) {
     params.set("resultRecordCount", String(plan.resultRecordCount));
+  }
+
+  if (typeof plan.resultOffset === "number" && plan.resultOffset >= 0) {
+    params.set("resultOffset", String(plan.resultOffset));
   }
 
   if (plan.orderByFields) {
@@ -52,8 +52,14 @@ export async function executeArcgisQuery(plan: QueryPlan): Promise<Record<string
     }
   }
 
-  const url = withQuery(plan.layer, params);
-  const res = await fetch(url);
+  const queryUrl = `${plan.layer}/query`;
+  const res = await fetch(queryUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+    },
+    body: params.toString()
+  });
   if (!res.ok) {
     throw new Error(`ArcGIS 查询失败: ${res.status}`);
   }

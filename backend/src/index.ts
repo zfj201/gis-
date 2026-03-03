@@ -7,11 +7,14 @@ import {
   spatialQueryDslSchema,
   type SpatialQueryDSL
 } from "@gis/shared";
-import { compileQueryPlan } from "./compiler.js";
 import { config } from "./config.js";
-import { executeArcgisQuery, fetchLayerMeta } from "./arcgis.js";
+import { fetchLayerMeta } from "./arcgis.js";
+import { isUserFacingError } from "./errors.js";
+import { layerRegistry } from "./layer-registry.js";
 import { summarizeResult } from "./narrator.js";
+import { defaultOutputFields } from "./semantic-routing.js";
 import { answerGeneralQuestion, isSpatialQuestion, parseQuestionSmart } from "./semantic-llm.js";
+import { executeDsl } from "./spatial-executor.js";
 
 const app = Fastify({ logger: true });
 
@@ -23,6 +26,13 @@ function buildVisualizationDsl(
     return dsl;
   }
 
+  const targetLayer = layerRegistry.getLayer(dsl.targetLayer);
+  if (!targetLayer) {
+    return null;
+  }
+
+  const baseOutputFields = defaultOutputFields(targetLayer);
+
   if (dsl.intent === "count" || dsl.aggregation?.type === "count") {
     const count = Number(payload.count ?? 0);
     const visualLimit = Math.min(Math.max(0, Number.isFinite(count) ? count : 0), 2000);
@@ -32,11 +42,12 @@ function buildVisualizationDsl(
 
     return {
       ...dsl,
+      targetLayer: targetLayer.layerKey,
       intent: "search",
       aggregation: null,
       limit: visualLimit,
       output: {
-        fields: ["fid", "名称", "地址", "区县"],
+        fields: baseOutputFields,
         returnGeometry: true
       }
     };
@@ -44,11 +55,12 @@ function buildVisualizationDsl(
 
   return {
     ...dsl,
+    targetLayer: targetLayer.layerKey,
     intent: "search",
     aggregation: null,
     limit: 2000,
     output: {
-      fields: ["fid", "名称", "地址", "区县"],
+      fields: baseOutputFields,
       returnGeometry: true
     }
   };
@@ -58,14 +70,106 @@ await app.register(cors, {
   origin: true
 });
 
+await layerRegistry.init();
+
 app.get("/health", async () => ({ ok: true, ts: new Date().toISOString() }));
 
-app.get("/api/layers/meta", async () => {
-  const meta = await fetchLayerMeta(config.parksLayerUrl);
-  return {
-    layer: config.parksLayerUrl,
-    meta
-  };
+app.get("/api/layers/catalog", async () => {
+  return layerRegistry.listCatalog();
+});
+
+app.post<{ Body: { serviceUrl: string } }>("/api/layers/catalog/register", async (req, reply) => {
+  const serviceUrl = String(req.body?.serviceUrl ?? "").trim();
+  if (!serviceUrl) {
+    return reply.code(400).send({ message: "serviceUrl 不能为空" });
+  }
+
+  try {
+    const result = await layerRegistry.registerService(serviceUrl);
+    return {
+      service: result.service,
+      layers: result.layers,
+      catalog: layerRegistry.listCatalog()
+    };
+  } catch (error) {
+    if (isUserFacingError(error)) {
+      return reply.code(error.statusCode).send({
+        message: error.message,
+        followUpQuestion: error.followUpQuestion ?? null,
+        details: error.details ?? null
+      });
+    }
+    req.log.error(error);
+    return reply.code(500).send({ message: "图层服务注册失败", error: (error as Error).message });
+  }
+});
+
+app.delete<{ Params: { serviceId: string } }>(
+  "/api/layers/catalog/service/:serviceId",
+  async (req, reply) => {
+    try {
+      await layerRegistry.removeService(req.params.serviceId);
+      return {
+        ok: true,
+        catalog: layerRegistry.listCatalog()
+      };
+    } catch (error) {
+      if (isUserFacingError(error)) {
+        return reply.code(error.statusCode).send({ message: error.message });
+      }
+      req.log.error(error);
+      return reply.code(500).send({ message: "删除服务失败", error: (error as Error).message });
+    }
+  }
+);
+
+app.patch<{ Params: { layerKey: string }; Body: { visibleByDefault?: boolean; queryable?: boolean } }>(
+  "/api/layers/catalog/layer/:layerKey",
+  async (req, reply) => {
+    const { visibleByDefault, queryable } = req.body ?? {};
+    if (typeof visibleByDefault !== "boolean" && typeof queryable !== "boolean") {
+      return reply.code(400).send({ message: "至少提供 visibleByDefault 或 queryable 的一个布尔值。" });
+    }
+
+    try {
+      const layer = await layerRegistry.updateLayerFlags(req.params.layerKey, {
+        visibleByDefault,
+        queryable
+      });
+      return {
+        layer,
+        catalog: layerRegistry.listCatalog()
+      };
+    } catch (error) {
+      if (isUserFacingError(error)) {
+        return reply.code(error.statusCode).send({ message: error.message });
+      }
+      req.log.error(error);
+      return reply.code(500).send({ message: "图层状态更新失败", error: (error as Error).message });
+    }
+  }
+);
+
+app.get<{ Querystring: { layerKey?: string } }>("/api/layers/meta", async (req, reply) => {
+  const layer = layerRegistry.getLayer(req.query.layerKey);
+  if (!layer) {
+    return reply.code(404).send({ message: "图层不存在" });
+  }
+
+  try {
+    const meta = await fetchLayerMeta(layer.url);
+    return {
+      layerKey: layer.layerKey,
+      layer: layer.url,
+      meta
+    };
+  } catch (error) {
+    if (isUserFacingError(error)) {
+      return reply.code(error.statusCode).send({ message: error.message });
+    }
+    req.log.error(error);
+    return reply.code(500).send({ message: "图层元数据请求失败", error: (error as Error).message });
+  }
 });
 
 app.post<{ Body: { question: string } }>("/api/semantic/parse", async (req, reply) => {
@@ -85,32 +189,43 @@ app.post<{ Body: { dsl: SpatialQueryDSL } }>("/api/spatial/execute", async (req,
   }
 
   try {
-    const plan = compileQueryPlan(result.data);
-    const payload = await executeArcgisQuery(plan);
+    const targetLayer = layerRegistry.getLayer(result.data.targetLayer);
+    const layerName = targetLayer?.name ?? "要素";
+    const executed = await executeDsl(result.data);
+    const plan = executed.plan;
+    const payload = executed.payload;
     let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
 
     if (typeof payload.count === "number" || result.data.intent === "group_stat") {
       const visualDsl = buildVisualizationDsl(result.data, payload);
       if (visualDsl) {
-        const visualPlan = compileQueryPlan(visualDsl);
-        const visualPayload = await executeArcgisQuery(visualPlan);
+        const visualExecuted = await executeDsl(visualDsl);
+        const visualPayload = visualExecuted.payload;
         features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
       } else {
         features = [];
       }
     }
 
-    const response: ExecuteResponse = {
+    const response: ExecuteResponse & { targetLayerName: string } = {
       resolvedEntities: [],
       queryPlan: plan,
       features,
-      summary: summarizeResult(result.data, payload),
+      summary: summarizeResult(result.data, payload, layerName),
       followUpQuestion: null,
-      parserSource: "rule"
+      parserSource: "rule",
+      targetLayerName: layerName
     };
 
     return response;
   } catch (error) {
+    if (isUserFacingError(error)) {
+      return reply.code(error.statusCode).send({
+        message: error.message,
+        followUpQuestion: error.followUpQuestion ?? null,
+        details: error.details ?? null
+      });
+    }
     req.log.error(error);
     return reply.code(500).send({ message: "空间查询执行失败", error: (error as Error).message });
   }
@@ -131,12 +246,15 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       features: [],
       summary: general.summary,
       followUpQuestion: null,
-      parserSource: general.parserSource
+      parserSource: general.parserSource,
+      parserFailureReason: null,
+      parserFailureDetail: null,
+      normalizedByRule: false
     };
   }
 
   const parsed = await parseQuestionSmart(question);
-  if (parsed.followUpQuestion && !parsed.dsl.spatialFilter?.center) {
+  if (parsed.followUpQuestion) {
     return {
       dsl: parsed.dsl,
       resolvedEntities: [],
@@ -144,20 +262,26 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       features: [],
       summary: parsed.followUpQuestion,
       followUpQuestion: parsed.followUpQuestion,
-      parserSource: parsed.parserSource
+      parserSource: parsed.parserSource,
+      parserFailureReason: parsed.parserFailureReason ?? null,
+      parserFailureDetail: parsed.parserFailureDetail ?? null,
+      normalizedByRule: parsed.normalizedByRule ?? false
     };
   }
 
   try {
-    const plan = compileQueryPlan(parsed.dsl);
-    const payload = await executeArcgisQuery(plan);
+    const targetLayer = layerRegistry.getLayer(parsed.dsl.targetLayer);
+    const layerName = targetLayer?.name ?? "要素";
+    const executed = await executeDsl(parsed.dsl);
+    const plan = executed.plan;
+    const payload = executed.payload;
     let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
 
     if (typeof payload.count === "number" || parsed.dsl.intent === "group_stat") {
       const visualDsl = buildVisualizationDsl(parsed.dsl, payload);
       if (visualDsl) {
-        const visualPlan = compileQueryPlan(visualDsl);
-        const visualPayload = await executeArcgisQuery(visualPlan);
+        const visualExecuted = await executeDsl(visualDsl);
+        const visualPayload = visualExecuted.payload;
         features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
       } else {
         features = [];
@@ -169,11 +293,29 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       resolvedEntities: [],
       queryPlan: plan,
       features,
-      summary: summarizeResult(parsed.dsl, payload),
+      summary: summarizeResult(parsed.dsl, payload, layerName),
       followUpQuestion: parsed.followUpQuestion,
-      parserSource: parsed.parserSource
+      parserSource: parsed.parserSource,
+      parserFailureReason: parsed.parserFailureReason ?? null,
+      parserFailureDetail: parsed.parserFailureDetail ?? null,
+      normalizedByRule: parsed.normalizedByRule ?? false,
+      targetLayerName: layerName
     };
   } catch (error) {
+    if (isUserFacingError(error)) {
+      return {
+        dsl: parsed.dsl,
+        resolvedEntities: [],
+        queryPlan: null,
+        features: [],
+        summary: error.followUpQuestion ?? error.message,
+        followUpQuestion: error.followUpQuestion ?? error.message,
+        parserSource: parsed.parserSource,
+        parserFailureReason: parsed.parserFailureReason ?? null,
+        parserFailureDetail: parsed.parserFailureDetail ?? null,
+        normalizedByRule: parsed.normalizedByRule ?? false
+      };
+    }
     req.log.error(error);
     return reply.code(500).send({
       message: "对话查询失败",

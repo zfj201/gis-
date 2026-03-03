@@ -16,12 +16,29 @@ export const locationTypeSchema = z.enum([
   "unknown"
 ]);
 
+export const operatorSchema = z.enum([
+  "=",
+  "like",
+  ">",
+  ">=",
+  "<",
+  "<="
+]);
+
+export const attributeFilterSchema = z.object({
+  field: z.string().min(1),
+  operator: operatorSchema,
+  value: z.string().min(1)
+});
+
 export const spatialFilterSchema = z
   .object({
     type: z.enum(["buffer", "intersects", "nearest"]).optional(),
     radius: z.number().positive().optional(),
     unit: z.enum(["meter", "kilometer"]).optional(),
     ringOnly: z.boolean().optional(),
+    sourceLayer: z.string().min(1).optional(),
+    sourceAttributeFilter: z.array(attributeFilterSchema).optional(),
     center: z
       .object({
         x: z.number(),
@@ -36,12 +53,6 @@ export const spatialFilterSchema = z
       .optional()
   })
   .optional();
-
-export const attributeFilterSchema = z.object({
-  field: z.string().min(1),
-  operator: z.enum(["=", "like"]),
-  value: z.string().min(1)
-});
 
 export const spatialQueryDslSchema = z.object({
   intent: intentSchema,
@@ -70,7 +81,7 @@ export const spatialQueryDslSchema = z.object({
     .optional(),
   limit: z.number().int().positive().max(2000).default(20),
   output: z.object({
-    fields: z.array(z.string()).default(["fid", "名称", "地址", "区县"]),
+    fields: z.array(z.string()).default([]),
     returnGeometry: z.boolean().default(true)
   })
 });
@@ -83,6 +94,9 @@ export interface ParseResponse {
   confidence: number;
   followUpQuestion: string | null;
   parserSource: ParserSource;
+  parserFailureReason?: string;
+  parserFailureDetail?: string;
+  normalizedByRule?: boolean;
 }
 
 export interface QueryPlan {
@@ -97,6 +111,7 @@ export interface QueryPlan {
   returnGeometry: boolean;
   orderByFields?: string;
   resultRecordCount?: number;
+  resultOffset?: number;
   returnCountOnly?: boolean;
   groupByFieldsForStatistics?: string;
   outStatistics?: string;
@@ -109,4 +124,7 @@ export interface ExecuteResponse {
   summary: string;
   followUpQuestion: string | null;
   parserSource?: ParserSource;
+  parserFailureReason?: string;
+  parserFailureDetail?: string;
+  normalizedByRule?: boolean;
 }

@@ -1,7 +1,20 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const backendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const workspaceRoot = path.resolve(backendRoot, "..");
+
+function parseHosts(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3300),
   host: process.env.HOST ?? "0.0.0.0",
-  parksLayerUrl:
+  defaultParksLayerUrl:
     process.env.ARCGIS_PARKS_LAYER_URL ??
     "https://www.geosceneonline.cn/server/rest/services/Hosted/%E7%A6%8F%E5%B7%9E%E5%B8%82%E5%85%AC%E5%9B%AD%E7%82%B9/FeatureServer/0",
   maxRadiusMeters: Number(process.env.MAX_RADIUS_METERS ?? 0),
@@ -16,8 +29,14 @@ export const config = {
   openrouterModel: process.env.OPENROUTER_MODEL ?? "openrouter/free",
   openrouterTimeoutMs: Number(process.env.OPENROUTER_TIMEOUT_MS ?? 12000),
   openrouterSiteUrl: process.env.OPENROUTER_SITE_URL ?? "",
-  openrouterAppName: process.env.OPENROUTER_APP_NAME ?? "gis-semantic-query"
+  openrouterAppName: process.env.OPENROUTER_APP_NAME ?? "gis-semantic-query",
+  layerRegistryPath: path.resolve(
+    workspaceRoot,
+    process.env.LAYER_REGISTRY_PATH ?? "backend/data/layer-registry.json"
+  ),
+  layerMetaTimeoutMs: Number(process.env.LAYER_META_TIMEOUT_MS ?? 8000),
+  allowedLayerHosts: parseHosts(
+    process.env.ALLOWED_LAYER_HOSTS ?? "www.geosceneonline.cn,geosceneonline.cn"
+  ),
+  maxRegisteredServices: Number(process.env.MAX_REGISTERED_SERVICES ?? 20)
 } as const;
-
-export const allowedFields = new Set(["fid", "objectid", "名称", "地址", "城市", "区县"]);
-export const allowedFilterFields = new Set(["名称", "地址", "城市", "区县"]);
