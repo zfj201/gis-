@@ -19,6 +19,11 @@ interface FocusRequestLike {
   nonce: number;
 }
 
+interface SelectionChangePayload {
+  layerKey: string;
+  selectedObjectIds: Array<string | number>;
+}
+
 const props = defineProps<{
   features: FeatureLike[];
   bufferOverlay?: BufferOverlayLike | null;
@@ -27,11 +32,16 @@ const props = defineProps<{
   responseNonce?: number;
 }>();
 
+const emit = defineEmits<{
+  (event: "selection-change", payload: SelectionChangePayload): void;
+}>();
+
 const mapEl = ref<HTMLDivElement | null>(null);
 let mapRef: any = null;
 let view: any = null;
 let highlightLayer: any = null;
 let bufferLayer: any = null;
+let selectionLayer: any = null;
 let FeatureLayerCtor: any = null;
 let GraphicsLayerCtor: any = null;
 let GraphicCtor: any = null;
@@ -40,6 +50,8 @@ let ExtentCtor: any = null;
 let geometryEngine: any = null;
 let geometryJsonUtils: any = null;
 const dataLayers = new Map<string, any>();
+const selectedIdsByLayer = new Map<string, Set<string>>();
+const selectedGraphicByKey = new Map<string, any>();
 let hasInitialZoom = false;
 let pendingFocusServiceId: string | null = null;
 
@@ -137,6 +149,96 @@ function symbolForGeometryType(type: string): Record<string, unknown> {
   };
 }
 
+function selectionSymbolForGeometryType(type: string): Record<string, unknown> {
+  if (type === "polygon") {
+    return {
+      type: "simple-fill",
+      color: [31, 111, 235, 0.08],
+      outline: {
+        color: [31, 111, 235, 1],
+        width: 2.5
+      }
+    };
+  }
+
+  if (type === "polyline") {
+    return {
+      type: "simple-line",
+      color: [31, 111, 235, 1],
+      width: 4
+    };
+  }
+
+  return {
+    type: "simple-marker",
+    color: [31, 111, 235, 0.95],
+    size: 10,
+    outline: {
+      color: [255, 255, 255, 1],
+      width: 1.2
+    }
+  };
+}
+
+function layerKeyFromInstance(layerInstance: any): string | null {
+  for (const [layerKey, instance] of dataLayers.entries()) {
+    if (instance === layerInstance) {
+      return layerKey;
+    }
+  }
+  return null;
+}
+
+function layerDescriptorByKey(layerKey: string): LayerDescriptor | undefined {
+  return props.layers.find((layer) => layer.layerKey === layerKey);
+}
+
+function normalizeObjectId(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function emitAllSelection(): void {
+  for (const layer of props.layers) {
+    emit("selection-change", {
+      layerKey: layer.layerKey,
+      selectedObjectIds: Array.from(selectedIdsByLayer.get(layer.layerKey) ?? [])
+    });
+  }
+}
+
+function clearAllSelection(): void {
+  selectedIdsByLayer.clear();
+  selectedGraphicByKey.clear();
+  selectionLayer?.removeAll();
+  emitAllSelection();
+}
+
+function clearRemovedLayerSelections(nextLayers: LayerDescriptor[]): void {
+  const aliveKeys = new Set(nextLayers.map((layer) => layer.layerKey));
+  for (const key of Array.from(selectedIdsByLayer.keys())) {
+    if (!aliveKeys.has(key)) {
+      selectedIdsByLayer.delete(key);
+    }
+  }
+  for (const key of Array.from(selectedGraphicByKey.keys())) {
+    const layerKey = key.split("|")[0];
+    if (!aliveKeys.has(layerKey)) {
+      selectedGraphicByKey.delete(key);
+    }
+  }
+  if (selectionLayer) {
+    selectionLayer.removeAll();
+    if (selectedGraphicByKey.size > 0) {
+      selectionLayer.addMany(Array.from(selectedGraphicByKey.values()));
+    }
+  }
+  emitAllSelection();
+}
+
 async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
   if (!mapRef || !FeatureLayerCtor) {
     return;
@@ -149,6 +251,7 @@ async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
       dataLayers.delete(layerKey);
     }
   }
+  clearRemovedLayerSelections(nextLayers);
 
   for (const layer of nextLayers) {
     let layerInstance = dataLayers.get(layer.layerKey);
@@ -300,6 +403,101 @@ async function goToServiceExtent(serviceId: string): Promise<void> {
   }
 }
 
+async function handleMapClick(event: any): Promise<void> {
+  if (!view || !GraphicCtor || !selectionLayer) {
+    return;
+  }
+
+  const includeLayers = Array.from(dataLayers.values());
+  if (includeLayers.length === 0) {
+    clearAllSelection();
+    return;
+  }
+
+  let hit: any = null;
+  try {
+    hit = await view.hitTest(event, { include: includeLayers });
+  } catch (error) {
+    console.error("Map hitTest failed:", error);
+    return;
+  }
+
+  const picked = (hit?.results ?? []).find((item: any) => {
+    const layerInstance = item?.graphic?.layer;
+    return layerInstance && includeLayers.includes(layerInstance);
+  });
+
+  if (!picked?.graphic) {
+    clearAllSelection();
+    return;
+  }
+
+  const layerKey = layerKeyFromInstance(picked.graphic.layer);
+  if (!layerKey) {
+    return;
+  }
+
+  const descriptor = layerDescriptorByKey(layerKey);
+  if (!descriptor) {
+    return;
+  }
+
+  const objectId = normalizeObjectId(picked.graphic.attributes?.[descriptor.objectIdField]);
+  if (!objectId) {
+    return;
+  }
+
+  const selectedKey = `${layerKey}|${objectId}`;
+  const ctrlPressed = Boolean(event?.native?.ctrlKey || event?.native?.metaKey);
+  const isSelected = selectedGraphicByKey.has(selectedKey);
+
+  if (!ctrlPressed) {
+    if (isSelected && selectedGraphicByKey.size === 1) {
+      clearAllSelection();
+      return;
+    }
+    selectedGraphicByKey.clear();
+    selectedIdsByLayer.clear();
+    selectionLayer.removeAll();
+  }
+
+  if (isSelected) {
+    selectedGraphicByKey.delete(selectedKey);
+    const ids = selectedIdsByLayer.get(layerKey);
+    ids?.delete(objectId);
+    if (ids && ids.size === 0) {
+      selectedIdsByLayer.delete(layerKey);
+    }
+  } else {
+    const geometry = picked.graphic.geometry?.toJSON
+      ? picked.graphic.geometry.toJSON()
+      : picked.graphic.geometry;
+    const normalizedGeometry =
+      geometry && typeof geometry === "object"
+        ? toGraphicGeometry(geometry as Record<string, unknown>)
+        : null;
+    if (!normalizedGeometry) {
+      return;
+    }
+    const selectionGraphic = new GraphicCtor({
+      geometry: normalizedGeometry,
+      symbol: selectionSymbolForGeometryType(String(normalizedGeometry.type ?? "point")),
+      attributes: picked.graphic.attributes
+    });
+    selectedGraphicByKey.set(selectedKey, selectionGraphic);
+    if (!selectedIdsByLayer.has(layerKey)) {
+      selectedIdsByLayer.set(layerKey, new Set<string>());
+    }
+    selectedIdsByLayer.get(layerKey)?.add(objectId);
+  }
+
+  selectionLayer.removeAll();
+  if (selectedGraphicByKey.size > 0) {
+    selectionLayer.addMany(Array.from(selectedGraphicByKey.values()));
+  }
+  emitAllSelection();
+}
+
 async function initMap(): Promise<void> {
   if (!mapEl.value) {
     return;
@@ -328,10 +526,11 @@ async function initMap(): Promise<void> {
 
   highlightLayer = new GraphicsLayerCtor();
   bufferLayer = new GraphicsLayerCtor();
+  selectionLayer = new GraphicsLayerCtor();
 
   mapRef = new EsriMap({
     basemap: "streets-vector",
-    layers: [bufferLayer, highlightLayer]
+    layers: [bufferLayer, highlightLayer, selectionLayer]
   });
 
   view = new MapView({
@@ -347,6 +546,9 @@ async function initMap(): Promise<void> {
   });
 
   await syncFeatureLayers(props.layers);
+  view.on("click", (event: any) => {
+    void handleMapClick(event);
+  });
   if (pendingFocusServiceId) {
     const serviceId = pendingFocusServiceId;
     pendingFocusServiceId = null;

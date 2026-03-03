@@ -8,7 +8,7 @@ import {
   type SpatialQueryDSL
 } from "@gis/shared";
 import { config } from "./config.js";
-import { fetchLayerMeta } from "./arcgis.js";
+import { fetchLayerMeta, queryArcgisLayer } from "./arcgis.js";
 import { isUserFacingError } from "./errors.js";
 import { layerRegistry } from "./layer-registry.js";
 import { summarizeResult } from "./narrator.js";
@@ -17,6 +17,9 @@ import { answerGeneralQuestion, isSpatialQuestion, parseQuestionSmart } from "./
 import { executeDsl } from "./spatial-executor.js";
 
 const app = Fastify({ logger: true });
+
+const MAX_EXPORT_PAGE_SIZE = 5000;
+const SELECTED_IN_CLAUSE_CHUNK = 800;
 
 function buildVisualizationDsl(
   dsl: SpatialQueryDSL,
@@ -64,6 +67,83 @@ function buildVisualizationDsl(
       returnGeometry: true
     }
   };
+}
+
+function escapeSqlValue(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function isNumericFieldType(fieldType: string | undefined): boolean {
+  if (!fieldType) {
+    return true;
+  }
+  return [
+    "esriFieldTypeOID",
+    "esriFieldTypeInteger",
+    "esriFieldTypeSmallInteger",
+    "esriFieldTypeDouble",
+    "esriFieldTypeSingle"
+  ].includes(fieldType);
+}
+
+function parseSelectedObjectIds(
+  rawValues: unknown,
+  numericObjectId: boolean
+): Array<number | string> {
+  if (!Array.isArray(rawValues)) {
+    return [];
+  }
+
+  const result: Array<number | string> = [];
+  const seen = new Set<string>();
+  for (const item of rawValues) {
+    const text = String(item ?? "").trim();
+    if (!text) {
+      continue;
+    }
+    if (numericObjectId) {
+      const value = Number(text);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      const key = String(value);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      result.push(value);
+      continue;
+    }
+    if (seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function buildSelectedWhere(
+  objectIdField: string,
+  values: Array<number | string>,
+  numericObjectId: boolean
+): string {
+  if (values.length === 0) {
+    return "1=0";
+  }
+
+  const clauses: string[] = [];
+  for (let i = 0; i < values.length; i += SELECTED_IN_CLAUSE_CHUNK) {
+    const chunk = values.slice(i, i + SELECTED_IN_CLAUSE_CHUNK);
+    if (numericObjectId) {
+      const raw = chunk.map((value) => Number(value)).join(",");
+      clauses.push(`${objectIdField} IN (${raw})`);
+    } else {
+      const raw = chunk.map((value) => `'${escapeSqlValue(String(value))}'`).join(",");
+      clauses.push(`${objectIdField} IN (${raw})`);
+    }
+  }
+  return clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
 }
 
 await app.register(cors, {
@@ -169,6 +249,124 @@ app.get<{ Querystring: { layerKey?: string } }>("/api/layers/meta", async (req, 
     }
     req.log.error(error);
     return reply.code(500).send({ message: "图层元数据请求失败", error: (error as Error).message });
+  }
+});
+
+app.post<{
+  Body: {
+    layerKey: string;
+    mode?: "selected" | "all";
+    selectedObjectIds?: Array<number | string>;
+    cursor?: number;
+    pageSize?: number;
+  };
+}>("/api/layers/export/features-page", async (req, reply) => {
+  const startedAt = Date.now();
+  const layerKey = String(req.body?.layerKey ?? "").trim();
+  if (!layerKey) {
+    return reply.code(400).send({ message: "layerKey 不能为空。" });
+  }
+
+  const layer = layerRegistry.getLayer(layerKey);
+  if (!layer || !layer.queryable) {
+    return reply.code(404).send({ message: `图层 ${layerKey} 不存在或不可查询。` });
+  }
+
+  const mode = req.body?.mode === "selected" ? "selected" : "all";
+  const cursor = Math.max(0, Math.floor(Number(req.body?.cursor ?? 0) || 0));
+  const requestedPageSize = Number(req.body?.pageSize ?? config.exportPageSize);
+  const pageSize = Math.max(
+    1,
+    Math.min(Number.isFinite(requestedPageSize) ? Math.floor(requestedPageSize) : config.exportPageSize, MAX_EXPORT_PAGE_SIZE)
+  );
+  const maxExportFeatures = Math.max(1, config.exportMaxFeatures);
+
+  const objectIdField = layer.objectIdField;
+  const objectIdFieldType = layer.fields.find((field) => field.name === objectIdField)?.type;
+  const numericObjectId = isNumericFieldType(objectIdFieldType);
+  const selectedObjectIds = parseSelectedObjectIds(req.body?.selectedObjectIds, numericObjectId);
+  const where =
+    mode === "selected"
+      ? buildSelectedWhere(objectIdField, selectedObjectIds, numericObjectId)
+      : "1=1";
+
+  try {
+    const countPayload = await queryArcgisLayer(layer.url, {
+      f: "pjson",
+      where,
+      returnCountOnly: "true"
+    });
+    const totalMatched = Number(countPayload.count ?? 0);
+
+    if (totalMatched > maxExportFeatures) {
+      return reply.code(400).send({
+        message: `导出数量 ${totalMatched} 超过上限 ${maxExportFeatures}。请缩小条件或提高 EXPORT_MAX_FEATURES。`,
+        totalMatched,
+        maxExportFeatures
+      });
+    }
+
+    if (totalMatched <= 0 || cursor >= totalMatched) {
+      return {
+        layerKey: layer.layerKey,
+        layerName: layer.name,
+        objectIdField,
+        geometryType: layer.geometryType,
+        fields: layer.fields,
+        cursor,
+        nextCursor: cursor,
+        hasMore: false,
+        totalMatched,
+        fetched: 0,
+        maxExportFeatures,
+        features: []
+      };
+    }
+
+    const pagePayload = await queryArcgisLayer(layer.url, {
+      f: "pjson",
+      where,
+      outFields: "*",
+      returnGeometry: "true",
+      outSR: "3857",
+      orderByFields: `${objectIdField} asc`,
+      resultOffset: String(cursor),
+      resultRecordCount: String(pageSize)
+    });
+    const features = Array.isArray(pagePayload.features)
+      ? (pagePayload.features as Array<Record<string, unknown>>)
+      : [];
+    const fetched = features.length;
+    const nextCursor = cursor + fetched;
+    const hasMore = nextCursor < totalMatched;
+
+    req.log.info({
+      layerKey: layer.layerKey,
+      mode,
+      totalMatched,
+      fetched,
+      cursor,
+      nextCursor,
+      durationMs: Date.now() - startedAt
+    }, "[export] features-page");
+
+    return {
+      layerKey: layer.layerKey,
+      layerName: layer.name,
+      objectIdField,
+      geometryType: layer.geometryType,
+      fields: layer.fields,
+      cursor,
+      nextCursor,
+      hasMore,
+      totalMatched,
+      fetched,
+      maxExportFeatures,
+      features
+    };
+  } catch (error) {
+    req.log.error(error);
+    return reply.code(500).send({ message: "导出分页查询失败", error: (error as Error).message });
   }
 });
 

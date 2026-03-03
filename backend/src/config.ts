@@ -30,6 +30,8 @@ export const config = {
   openrouterTimeoutMs: Number(process.env.OPENROUTER_TIMEOUT_MS ?? 12000),
   openrouterSiteUrl: process.env.OPENROUTER_SITE_URL ?? "",
   openrouterAppName: process.env.OPENROUTER_APP_NAME ?? "gis-semantic-query",
+  exportMaxFeatures: Number(process.env.EXPORT_MAX_FEATURES ?? 200000),
+  exportPageSize: Number(process.env.EXPORT_PAGE_SIZE ?? 1000),
   layerRegistryPath: path.resolve(
     workspaceRoot,
     process.env.LAYER_REGISTRY_PATH ?? "backend/data/layer-registry.json"

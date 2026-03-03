@@ -52,13 +52,21 @@ export async function executeArcgisQuery(plan: QueryPlan): Promise<Record<string
     }
   }
 
-  const queryUrl = `${plan.layer}/query`;
+  return queryArcgisLayer(plan.layer, params);
+}
+
+export async function queryArcgisLayer(
+  layerUrl: string,
+  params: URLSearchParams | Record<string, string>
+): Promise<Record<string, unknown>> {
+  const resolvedParams = params instanceof URLSearchParams ? params : new URLSearchParams(params);
+  const queryUrl = `${layerUrl}/query`;
   const res = await fetch(queryUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
     },
-    body: params.toString()
+    body: resolvedParams.toString()
   });
   if (!res.ok) {
     throw new Error(`ArcGIS 查询失败: ${res.status}`);

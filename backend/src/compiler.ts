@@ -82,14 +82,27 @@ function buildWhere(dsl: SpatialQueryDSL, fieldTypes: Map<string, string>): stri
   return clauses.join(" AND ");
 }
 
-function normalizeOutFields(dsl: SpatialQueryDSL, allowedFields: Set<string>, fallbackFields: string[]): string {
+function normalizeOutFields(
+  dsl: SpatialQueryDSL,
+  allowedFields: Set<string>,
+  fallbackFields: string[],
+  objectIdField: string
+): string {
   if (fallbackFields.length === 0) {
     throw new UserFacingError("目标图层缺少可输出字段，无法执行查询。");
   }
 
+  const appendObjectIdField = (fields: string[]): string[] => {
+    const deduped = Array.from(new Set(fields));
+    if (allowedFields.has(objectIdField) && !deduped.includes(objectIdField)) {
+      deduped.push(objectIdField);
+    }
+    return deduped;
+  };
+
   const requested = dsl.output.fields ?? [];
   if (requested.length === 0) {
-    return fallbackFields.join(",");
+    return appendObjectIdField(fallbackFields).join(",");
   }
 
   for (const field of requested) {
@@ -98,7 +111,7 @@ function normalizeOutFields(dsl: SpatialQueryDSL, allowedFields: Set<string>, fa
     }
   }
 
-  return requested.join(",");
+  return appendObjectIdField(requested).join(",");
 }
 
 export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
@@ -114,7 +127,7 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
   const fieldTypeMap = new Map(queryableFields.map((field) => [field.name, field.type]));
   const fallbackFields = defaultOutputFields(layer);
   const where = buildWhere(dsl, fieldTypeMap);
-  const outFields = normalizeOutFields(dsl, allowedFieldSet, fallbackFields);
+  const outFields = normalizeOutFields(dsl, allowedFieldSet, fallbackFields, layer.objectIdField);
 
   const plan: QueryPlan = {
     layer: layer.url,

@@ -2,6 +2,7 @@
 import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import type { LayerCatalogResponse, LayerDescriptor } from "@gis/shared";
 import MapViewPanel from "./components/MapViewPanel.vue";
+import { downloadShapefileFromEsriFeatures } from "./utils/shapefileExport";
 
 interface ChatResponse {
   dsl?: Record<string, unknown> | null;
@@ -29,6 +30,27 @@ interface QueryPlanLike {
 interface FeatureItem {
   attributes?: Record<string, string | number | null | undefined>;
   geometry?: Record<string, unknown>;
+}
+
+interface SelectionChangePayload {
+  layerKey: string;
+  selectedObjectIds: Array<string | number>;
+}
+
+interface ExportFeaturesPageResponse {
+  message?: string;
+  layerKey?: string;
+  layerName?: string;
+  objectIdField?: string;
+  geometryType?: string;
+  fields?: Array<Record<string, unknown>>;
+  cursor?: number;
+  nextCursor?: number;
+  hasMore?: boolean;
+  totalMatched?: number;
+  fetched?: number;
+  maxExportFeatures?: number;
+  features?: FeatureItem[];
 }
 
 interface BufferOverlay {
@@ -61,8 +83,12 @@ const layerLoading = ref(false);
 const layerPanelOpen = ref(false);
 const expandedServices = ref<Record<string, boolean>>({});
 const focusServiceRequest = ref<{ serviceId: string; nonce: number } | null>(null);
-const serviceContextMenu = ref<{ serviceId: string; x: number; y: number } | null>(null);
-const serviceContextMenuEl = ref<HTMLDivElement | null>(null);
+const layerContextMenu = ref<{ layerKey: string; x: number; y: number } | null>(null);
+const layerContextMenuEl = ref<HTMLDivElement | null>(null);
+const manualSelectedIdsByLayer = ref<Record<string, string[]>>({});
+const querySelectedIdsByLayer = ref<Record<string, string[]>>({});
+const exportingLayerKey = ref<string | null>(null);
+const exportingProgress = ref<{ layerKey: string; fetched: number; total: number } | null>(null);
 const mapPanelRef = ref<{ focusService: (serviceId: string) => Promise<void> } | null>(null);
 const backendStatus = ref<"unknown" | "up" | "down">("unknown");
 const featuresForMap = ref<FeatureItem[]>([]);
@@ -205,21 +231,141 @@ function clampContextMenuPosition(x: number, y: number): { x: number; y: number 
   };
 }
 
-function openServiceContextMenu(serviceId: string, event: MouseEvent): void {
+function openLayerContextMenu(layerKey: string, event: MouseEvent): void {
   const { x, y } = clampContextMenuPosition(event.clientX, event.clientY);
-  serviceContextMenu.value = { serviceId, x, y };
+  layerContextMenu.value = { layerKey, x, y };
 }
 
-function closeServiceContextMenu(): void {
-  serviceContextMenu.value = null;
+function closeLayerContextMenu(): void {
+  layerContextMenu.value = null;
 }
 
-function zoomToServiceFromMenu(): void {
-  if (!serviceContextMenu.value) {
+function normalizeObjectId(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function selectedCountByLayer(layerKey: string): number {
+  const manual = manualSelectedIdsByLayer.value[layerKey] ?? [];
+  const query = querySelectedIdsByLayer.value[layerKey] ?? [];
+  return new Set([...manual, ...query]).size;
+}
+
+function effectiveSelectedObjectIds(layerKey: string): string[] {
+  const manual = manualSelectedIdsByLayer.value[layerKey] ?? [];
+  const query = querySelectedIdsByLayer.value[layerKey] ?? [];
+  return Array.from(new Set([...manual, ...query]));
+}
+
+function buildExportFileName(layerName: string): string {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  const ss = String(now.getSeconds()).padStart(2, "0");
+  const safeName = layerName.replace(/[\\/:*?"<>|]+/g, "_").trim() || "layer_export";
+  return `${safeName}_${yyyy}${mm}${dd}_${hh}${mi}${ss}`;
+}
+
+function updateQuerySelectedObjectIds(layerKey: string | undefined, features: FeatureItem[]): void {
+  if (!layerKey) {
     return;
   }
-  zoomToService(serviceContextMenu.value.serviceId);
-  closeServiceContextMenu();
+  const layer = layerCatalog.value.layers.find((item) => item.layerKey === layerKey);
+  if (!layer) {
+    return;
+  }
+
+  const selected = features
+    .map((feature) => normalizeObjectId(feature.attributes?.[layer.objectIdField]))
+    .filter((item): item is string => Boolean(item));
+  querySelectedIdsByLayer.value[layerKey] = Array.from(new Set(selected));
+}
+
+function handleSelectionChange(payload: SelectionChangePayload): void {
+  const ids = Array.from(new Set(payload.selectedObjectIds.map((item) => String(item))));
+  if (ids.length === 0) {
+    delete manualSelectedIdsByLayer.value[payload.layerKey];
+    return;
+  }
+  manualSelectedIdsByLayer.value[payload.layerKey] = ids;
+}
+
+async function exportLayerAsShapefile(layerKey: string): Promise<void> {
+  const layer = layerCatalog.value.layers.find((item) => item.layerKey === layerKey);
+  if (!layer) {
+    layerError.value = `导出失败：未找到图层 ${layerKey}`;
+    return;
+  }
+  if (exportingLayerKey.value) {
+    return;
+  }
+
+  const selectedObjectIds = effectiveSelectedObjectIds(layerKey);
+  const mode: "selected" | "all" = selectedObjectIds.length > 0 ? "selected" : "all";
+  exportingLayerKey.value = layerKey;
+  exportingProgress.value = { layerKey, fetched: 0, total: 0 };
+  layerError.value = "";
+
+  try {
+    let cursor = 0;
+    let hasMore = true;
+    let totalMatched = 0;
+    const allFeatures: FeatureItem[] = [];
+    while (hasMore) {
+      const res = await fetch("/api/layers/export/features-page", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          layerKey,
+          mode,
+          selectedObjectIds: mode === "selected" ? selectedObjectIds : undefined,
+          cursor,
+          pageSize: 1000
+        })
+      });
+      const payload = (await res.json()) as ExportFeaturesPageResponse;
+      if (!res.ok) {
+        throw new Error(payload.message || `HTTP ${res.status}`);
+      }
+
+      const pageFeatures = Array.isArray(payload.features) ? payload.features : [];
+      allFeatures.push(...pageFeatures);
+      totalMatched = Number(payload.totalMatched ?? allFeatures.length);
+      exportingProgress.value = {
+        layerKey,
+        fetched: allFeatures.length,
+        total: totalMatched
+      };
+      hasMore = Boolean(payload.hasMore);
+      cursor = Number(payload.nextCursor ?? cursor + pageFeatures.length);
+    }
+
+    if (allFeatures.length === 0) {
+      layerError.value = `图层“${layer.name}”没有可导出的要素。`;
+      closeLayerContextMenu();
+      return;
+    }
+
+    await downloadShapefileFromEsriFeatures({
+      features: allFeatures,
+      fileNameBase: buildExportFileName(layer.name),
+      encoding: "UTF-8"
+    });
+    closeLayerContextMenu();
+  } catch (error) {
+    layerError.value = `导出失败：${(error as Error).message}`;
+  } finally {
+    exportingLayerKey.value = null;
+    exportingProgress.value = null;
+  }
 }
 
 function ensureServiceExpandedState(): void {
@@ -231,19 +377,19 @@ function ensureServiceExpandedState(): void {
 }
 
 function handleGlobalPointerDown(event: PointerEvent): void {
-  if (!serviceContextMenu.value) {
+  if (!layerContextMenu.value) {
     return;
   }
 
-  if (serviceContextMenuEl.value?.contains(event.target as Node)) {
+  if (layerContextMenuEl.value?.contains(event.target as Node)) {
     return;
   }
-  closeServiceContextMenu();
+  closeLayerContextMenu();
 }
 
 function handleGlobalKeyDown(event: KeyboardEvent): void {
   if (event.key === "Escape") {
-    closeServiceContextMenu();
+    closeLayerContextMenu();
   }
 }
 
@@ -460,6 +606,11 @@ async function runQuery(): Promise<void> {
     mapResponseNonce.value += 1;
     bufferOverlayForMap.value = toBufferOverlay(parsed.queryPlan ?? null);
     featuresForMap.value = (parsed.features as FeatureItem[] | undefined) ?? [];
+    querySelectedIdsByLayer.value = {};
+    const targetLayerKey = String((parsed.dsl as { targetLayer?: unknown } | null)?.targetLayer ?? "").trim() || undefined;
+    if (targetLayerKey) {
+      updateQuerySelectedObjectIds(targetLayerKey, featuresForMap.value);
+    }
     const targetLayerName =
       parsed.targetLayerName ?? targetLayerNameFromDsl(parsed.dsl as Record<string, unknown> | null);
 
@@ -485,6 +636,7 @@ async function runQuery(): Promise<void> {
     mapResponseNonce.value += 1;
     featuresForMap.value = [];
     bufferOverlayForMap.value = null;
+    querySelectedIdsByLayer.value = {};
     backendStatus.value = "down";
   } finally {
     loading.value = false;
@@ -587,6 +739,7 @@ onBeforeUnmount(() => {
         :layers="layerCatalog.layers"
         :focus-request="focusServiceRequest"
         :response-nonce="mapResponseNonce"
+        @selection-change="handleSelectionChange"
       />
       <div class="map-toolbox">
         <button class="layer-toggle-btn" @click="layerPanelOpen = !layerPanelOpen">
@@ -597,7 +750,7 @@ onBeforeUnmount(() => {
       <aside class="layer-drawer" :class="{ open: layerPanelOpen }">
         <div class="layer-manager">
         <div class="layer-manager-title">图层管理</div>
-        <div class="layer-tip">提示：右键图层行可快速定位到图层视角。</div>
+        <div class="layer-tip">提示：服务头部图标可移动视角，右键图层可导出 Shapefile。</div>
         <div class="layer-manager-form">
             <input
               v-model="layerServiceUrl"
@@ -614,7 +767,7 @@ onBeforeUnmount(() => {
           <div class="layer-service-list">
             <div v-for="service in layerCatalog.services" :key="service.serviceId" class="layer-service-card">
               <div class="layer-service-head">
-                <div class="service-head-left" @contextmenu.prevent="openServiceContextMenu(service.serviceId, $event)">
+                <div class="service-head-left">
                   <button
                     class="expand-btn"
                     type="button"
@@ -634,12 +787,22 @@ onBeforeUnmount(() => {
                         )
                       "
                     />
-                    <strong>{{ service.name }}</strong>
+                      <strong>{{ service.name }}</strong>
                   </label>
                 </div>
-                <button class="danger-btn" :disabled="layerLoading" @click="removeService(service.serviceId)">
-                  删除
-                </button>
+                <div class="service-actions">
+                  <button
+                    class="icon-btn"
+                    type="button"
+                    :title="`移动视角到 ${service.name}`"
+                    @click="zoomToService(service.serviceId)"
+                  >
+                    ⌖
+                  </button>
+                  <button class="danger-btn" :disabled="layerLoading" @click="removeService(service.serviceId)">
+                    删除
+                  </button>
+                </div>
               </div>
 
               <div v-if="isServiceExpanded(service.serviceId)" class="service-body">
@@ -649,6 +812,7 @@ onBeforeUnmount(() => {
                     v-for="layer in layerCatalog.layers.filter((item) => item.serviceId === service.serviceId)"
                     :key="layer.layerKey"
                     class="layer-item"
+                    @contextmenu.prevent="openLayerContextMenu(layer.layerKey, $event)"
                   >
                     <label class="layer-item-visibility">
                       <input
@@ -658,24 +822,37 @@ onBeforeUnmount(() => {
                       />
                       <span class="layer-name">{{ layer.name }}</span>
                     </label>
-                    <small>{{ layer.queryable ? "可查询" : "仅展示" }}</small>
+                    <small>
+                      {{ layer.queryable ? "可查询" : "仅展示" }}
+                      <template v-if="selectedCountByLayer(layer.layerKey) > 0">
+                        · 已选 {{ selectedCountByLayer(layer.layerKey) }}
+                      </template>
+                    </small>
                   </div>
                 </div>
               </div>
             </div>
           </div>
+          <div v-if="exportingProgress" class="layer-progress">
+            导出中... ({{ exportingProgress.fetched }}/{{ exportingProgress.total || "?" }})
+          </div>
         </div>
       </aside>
 
       <div
-        v-if="serviceContextMenu"
-        ref="serviceContextMenuEl"
+        v-if="layerContextMenu"
+        ref="layerContextMenuEl"
         class="service-context-menu"
-        :style="{ left: `${serviceContextMenu.x}px`, top: `${serviceContextMenu.y}px` }"
+        :style="{ left: `${layerContextMenu.x}px`, top: `${layerContextMenu.y}px` }"
         @contextmenu.prevent
       >
-        <button type="button" class="service-context-item" @click="zoomToServiceFromMenu">
-          移动视角（缩放至服务）
+        <button
+          type="button"
+          class="service-context-item"
+          :disabled="Boolean(exportingLayerKey)"
+          @click="layerContextMenu && exportLayerAsShapefile(layerContextMenu.layerKey)"
+        >
+          {{ exportingLayerKey ? "导出中..." : "导出 Shapefile" }}
         </button>
       </div>
     </main>
