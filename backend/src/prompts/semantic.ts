@@ -1,4 +1,5 @@
 import type { LayerDescriptor } from "@gis/shared";
+import { config } from "../config.js";
 
 export interface PromptMessage {
   role: "system" | "user" | "assistant";
@@ -31,6 +32,9 @@ function layerPromptBlock(layers: LayerDescriptor[]): string {
 }
 
 export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
+  const maxLimit = Math.max(1, config.queryMaxFeatures);
+  const nearestMax = Math.max(1, config.nearestMaxK);
+  const nearestDefault = Math.max(1, config.nearestDefaultK);
   const section1 = [
     "【第1段：角色与目标】",
     "你是 WebGIS 空间语义解析器。",
@@ -48,8 +52,10 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "【第3段：DSL 语义约束】",
     "dsl.intent 仅允许：search | count | group_stat | nearest | buffer_search。",
     "attributeFilter.operator 仅允许：= | like | > | >= | < | <=。",
-    "limit 必须 <= 2000；若用户未明确“前N”，search/buffer_search/nearest 的 limit 设为 2000。",
+    `search/buffer_search 的 limit 必须 <= ${maxLimit}；若用户未明确“前N”，默认设为 ${maxLimit}。`,
+    `nearest 的 limit 必须 <= ${nearestMax}；若用户未明确“前N”，默认设为 ${nearestDefault}。`,
     "buffer_search 需要 radius + unit(meter/kilometer)。",
+    "nearest 需要可解析的源要素：要么 spatialFilter.center（坐标），要么 sourceLayer+sourceAttributeFilter（单源）。",
     "字段名只能使用目标图层（或 sourceLayer）的可查询字段，不得自造字段。",
     "数值比较（> >= < <=）不得使用 like。",
     "统计问句（多少/几个/总数/数量）默认不注入“有多少个”等噪音过滤词。"
@@ -60,7 +66,8 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "“多少/几个/总数/数量” => intent=count 且 aggregation.type=count。",
     "“为/等于/就是/是/：” => 精确匹配 operator='='。",
     "“包含/含有/相关/类似” => 模糊匹配 operator='like'，并使用 %value%。",
-    "“附近/周边/X米内/X公里内” => intent=buffer_search。"
+    "“附近/周边/X米内/X公里内” => intent=buffer_search。",
+    "“最近/最近的/nearest” => intent=nearest。"
   ].join("\n");
 
   const section5 = [
@@ -98,6 +105,7 @@ function resolveSampleLayerKey(
 }
 
 export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDescriptor[] = []): PromptMessage[] {
+  const maxLimit = Math.max(1, config.queryMaxFeatures);
   const roadLayerKey = resolveSampleLayerKey(layers, /道路|街巷|路/, defaultLayerKey);
   const parcelLayerKey = resolveSampleLayerKey(layers, /宗地|院落|地块/, defaultLayerKey);
   const doorplateLayerKey = resolveSampleLayerKey(layers, /门牌|地址|门牌号码/, defaultLayerKey);
@@ -118,7 +126,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           targetLayer: roadLayerKey,
           attributeFilter: [{ field: "标准名称", operator: "=", value: "南二环" }],
           aggregation: null,
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: true }
         }
       })
@@ -138,7 +146,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           targetLayer: doorplateLayerKey,
           attributeFilter: [],
           aggregation: { type: "count" },
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: false }
         }
       })
@@ -171,7 +179,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           targetLayer: defaultLayerKey,
           attributeFilter: [{ field: "区县", operator: "=", value: "闽侯县" }],
           aggregation: { type: "count" },
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: false }
         }
       })
@@ -226,7 +234,70 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           },
           attributeFilter: [],
           aggregation: null,
-          limit: 2000,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "x:13303000,y:2996000 最近的公园"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "nearest",
+          targetLayer: defaultLayerKey,
+          locationEntity: {
+            rawText: "13303000,2996000",
+            type: "point",
+            resolution: "resolved"
+          },
+          spatialFilter: {
+            type: "nearest",
+            center: {
+              x: 13303000,
+              y: 2996000,
+              spatialReference: { wkid: 3857 }
+            }
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: Math.max(1, config.nearestDefaultK),
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "标准名称为南二环的道路街巷最近的门牌号码"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "nearest",
+          targetLayer: doorplateLayerKey,
+          locationEntity: {
+            rawText: "标准名称为南二环的道路街巷",
+            type: "road",
+            resolution: "resolved"
+          },
+          spatialFilter: {
+            type: "nearest",
+            sourceLayer: roadLayerKey,
+            sourceAttributeFilter: [{ field: "标准名称", operator: "=", value: "南二环" }]
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: Math.max(1, config.nearestDefaultK),
           output: { fields: [], returnGeometry: true }
         }
       })
@@ -264,7 +335,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           },
           attributeFilter: [],
           aggregation: null,
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: true }
         }
       })
@@ -302,7 +373,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           },
           attributeFilter: [],
           aggregation: null,
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: true }
         }
       })
@@ -340,7 +411,7 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           },
           attributeFilter: [],
           aggregation: null,
-          limit: 2000,
+          limit: maxLimit,
           output: { fields: [], returnGeometry: true }
         }
       })

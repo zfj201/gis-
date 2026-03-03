@@ -18,6 +18,12 @@ interface ChatResponse {
   parserFailureDetail?: string | null;
   normalizedByRule?: boolean;
   targetLayerName?: string;
+  executionMeta?: {
+    truncated?: boolean;
+    safetyCap?: number;
+    fetched?: number;
+    requestedLimit?: number;
+  };
 }
 
 interface QueryPlanLike {
@@ -25,6 +31,13 @@ interface QueryPlanLike {
   distance?: number | null;
   units?: string | null;
   geometryType?: string | null;
+  analysisType?: "nearest" | string;
+  nearestMeta?: {
+    topK?: number;
+    radiusUsedMeters?: number;
+    candidateCount?: number;
+    sourceMode?: "center" | "source_layer" | string;
+  };
 }
 
 interface FeatureItem {
@@ -74,6 +87,18 @@ interface ChatMessage {
   parserFailureDetail?: string | null;
   normalizedByRule?: boolean;
   targetLayerName?: string;
+  executionMeta?: {
+    truncated: boolean;
+    safetyCap: number;
+    fetched: number;
+    requestedLimit: number;
+  };
+  nearestMeta?: {
+    topK: number;
+    radiusUsedMeters: number;
+    candidateCount: number;
+    sourceMode: string;
+  } | null;
 }
 
 const question = ref("");
@@ -116,6 +141,9 @@ function toBufferOverlay(plan: Record<string, unknown> | null | undefined): Buff
   }
 
   const queryPlan = plan as QueryPlanLike;
+  if (queryPlan.analysisType === "nearest") {
+    return null;
+  }
   if (!queryPlan.geometryType || !queryPlan.geometry || typeof queryPlan.distance !== "number" || queryPlan.distance <= 0) {
     return null;
   }
@@ -129,6 +157,22 @@ function toBufferOverlay(plan: Record<string, unknown> | null | undefined): Buff
     geometry: queryPlan.geometry,
     geometryType: queryPlan.geometryType,
     radiusMeters: queryPlan.distance
+  };
+}
+
+function nearestMetaFromPlan(plan: Record<string, unknown> | null | undefined): ChatMessage["nearestMeta"] {
+  if (!plan) {
+    return null;
+  }
+  const queryPlan = plan as QueryPlanLike;
+  if (queryPlan.analysisType !== "nearest" || !queryPlan.nearestMeta) {
+    return null;
+  }
+  return {
+    topK: Number(queryPlan.nearestMeta.topK ?? 0),
+    radiusUsedMeters: Number(queryPlan.nearestMeta.radiusUsedMeters ?? 0),
+    candidateCount: Number(queryPlan.nearestMeta.candidateCount ?? 0),
+    sourceMode: String(queryPlan.nearestMeta.sourceMode ?? "")
   };
 }
 
@@ -178,6 +222,18 @@ function parserFailureReasonLabel(reason: string | null | undefined): string {
     return "模型HTTP错误";
   }
   return reason;
+}
+
+function featureCountText(message: ChatMessage): string {
+  const count = message.featureCount ?? 0;
+  if (count <= 0) {
+    return "";
+  }
+  const executionMeta = message.executionMeta;
+  if (executionMeta?.truncated) {
+    return `命中 ${count} 条要素（已触发安全阈值 ${executionMeta.safetyCap}，结果已截断）`;
+  }
+  return `命中 ${count} 条要素`;
 }
 
 function layerNameByKey(layerKey: string | undefined): string | undefined {
@@ -252,6 +308,41 @@ function selectedCountByLayer(layerKey: string): number {
   const manual = manualSelectedIdsByLayer.value[layerKey] ?? [];
   const query = querySelectedIdsByLayer.value[layerKey] ?? [];
   return new Set([...manual, ...query]).size;
+}
+
+function isPointLayer(layer: LayerDescriptor): boolean {
+  return /point/i.test(layer.geometryType);
+}
+
+async function togglePointRenderMode(
+  layer: LayerDescriptor,
+  nextMode: "default" | "heatmap"
+): Promise<void> {
+  const previous = layer.pointRenderMode ?? "default";
+  layer.pointRenderMode = nextMode;
+  try {
+    const res = await fetch(`/api/layers/catalog/layer/${encodeURIComponent(layer.layerKey)}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ pointRenderMode: nextMode })
+    });
+    const payload = (await res.json()) as {
+      message?: string;
+      catalog?: LayerCatalogResponse;
+    };
+    if (!res.ok) {
+      throw new Error(payload.message || `HTTP ${res.status}`);
+    }
+    if (payload.catalog) {
+      layerCatalog.value = payload.catalog;
+    }
+    layerError.value = "";
+  } catch (error) {
+    layer.pointRenderMode = previous;
+    layerError.value = `图层渲染模式更新失败：${(error as Error).message}`;
+  }
 }
 
 function effectiveSelectedObjectIds(layerKey: string): string[] {
@@ -625,7 +716,16 @@ async function runQuery(): Promise<void> {
       parserFailureReason: parsed.parserFailureReason ?? null,
       parserFailureDetail: parsed.parserFailureDetail ?? null,
       normalizedByRule: parsed.normalizedByRule ?? false,
-      targetLayerName
+      targetLayerName,
+      executionMeta: parsed.executionMeta
+        ? {
+            truncated: Boolean(parsed.executionMeta.truncated),
+            safetyCap: Number(parsed.executionMeta.safetyCap ?? 0),
+            fetched: Number(parsed.executionMeta.fetched ?? 0),
+            requestedLimit: Number(parsed.executionMeta.requestedLimit ?? 0)
+          }
+        : undefined,
+      nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null)
     });
   } catch (error) {
     pushMessage({
@@ -682,7 +782,11 @@ onBeforeUnmount(() => {
 
             <div v-if="message.error" class="msg-error">{{ message.error }}</div>
             <div v-if="message.featureCount && message.featureCount > 0" class="msg-meta">
-              命中 {{ message.featureCount }} 条要素
+              {{ featureCountText(message) }}
+            </div>
+            <div v-if="message.role === 'assistant' && message.nearestMeta" class="msg-meta">
+              最近邻 Top{{ message.nearestMeta.topK }} · 候选 {{ message.nearestMeta.candidateCount }} · 使用半径
+              {{ message.nearestMeta.radiusUsedMeters }}m
             </div>
             <div v-if="message.role === 'assistant' && message.targetLayerName" class="msg-meta">
               目标图层：{{ message.targetLayerName }}
@@ -814,20 +918,35 @@ onBeforeUnmount(() => {
                     class="layer-item"
                     @contextmenu.prevent="openLayerContextMenu(layer.layerKey, $event)"
                   >
-                    <label class="layer-item-visibility">
+                    <div class="layer-item-main">
+                      <label class="layer-item-visibility">
+                        <input
+                          type="checkbox"
+                          :checked="layer.visibleByDefault"
+                          @change="toggleLayerVisibility(layer, ($event.target as HTMLInputElement).checked)"
+                        />
+                        <span class="layer-name">{{ layer.name }}</span>
+                      </label>
+                      <small>
+                        {{ layer.queryable ? "可查询" : "仅展示" }}
+                        <template v-if="selectedCountByLayer(layer.layerKey) > 0">
+                          · 已选 {{ selectedCountByLayer(layer.layerKey) }}
+                        </template>
+                      </small>
+                    </div>
+                    <label v-if="isPointLayer(layer)" class="heatmap-switch">
                       <input
                         type="checkbox"
-                        :checked="layer.visibleByDefault"
-                        @change="toggleLayerVisibility(layer, ($event.target as HTMLInputElement).checked)"
+                        :checked="(layer.pointRenderMode ?? 'default') === 'heatmap'"
+                        @change="
+                          togglePointRenderMode(
+                            layer,
+                            ($event.target as HTMLInputElement).checked ? 'heatmap' : 'default'
+                          )
+                        "
                       />
-                      <span class="layer-name">{{ layer.name }}</span>
+                      热力图
                     </label>
-                    <small>
-                      {{ layer.queryable ? "可查询" : "仅展示" }}
-                      <template v-if="selectedCountByLayer(layer.layerKey) > 0">
-                        · 已选 {{ selectedCountByLayer(layer.layerKey) }}
-                      </template>
-                    </small>
                   </div>
                 </div>
               </div>

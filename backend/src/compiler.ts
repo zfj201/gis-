@@ -138,8 +138,7 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
     distance: null,
     units: null,
     outFields,
-    returnGeometry: dsl.output.returnGeometry,
-    resultRecordCount: dsl.limit
+    returnGeometry: dsl.output.returnGeometry
   };
 
   if (dsl.sort?.by) {

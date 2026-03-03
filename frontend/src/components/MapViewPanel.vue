@@ -50,6 +50,7 @@ let ExtentCtor: any = null;
 let geometryEngine: any = null;
 let geometryJsonUtils: any = null;
 const dataLayers = new Map<string, any>();
+const defaultRendererByLayer = new Map<string, any>();
 const selectedIdsByLayer = new Map<string, Set<string>>();
 const selectedGraphicByKey = new Map<string, any>();
 let hasInitialZoom = false;
@@ -66,6 +67,35 @@ function createPopupTemplate(layer: LayerDescriptor): Record<string, unknown> {
     title,
     content: content || `${layer.name}`
   };
+}
+
+function isPointLayer(layer: LayerDescriptor): boolean {
+  return /point/i.test(layer.geometryType);
+}
+
+function createHeatmapRenderer(): Record<string, unknown> {
+  return {
+    type: "heatmap",
+    minPixelIntensity: 0,
+    maxPixelIntensity: 120,
+    colorStops: [
+      { ratio: 0, color: "rgba(63, 86, 140, 0)" },
+      { ratio: 0.2, color: "rgba(76, 175, 80, 0.55)" },
+      { ratio: 0.45, color: "rgba(255, 193, 7, 0.72)" },
+      { ratio: 0.7, color: "rgba(255, 87, 34, 0.85)" },
+      { ratio: 1, color: "rgba(183, 28, 28, 0.98)" }
+    ]
+  };
+}
+
+function rendererForLayer(layer: LayerDescriptor): Record<string, unknown> | undefined {
+  if (!isPointLayer(layer)) {
+    return undefined;
+  }
+  if (layer.pointRenderMode === "heatmap") {
+    return createHeatmapRenderer();
+  }
+  return undefined;
 }
 
 function toGraphicGeometry(rawGeometry: Record<string, unknown> | undefined): Record<string, unknown> | null {
@@ -239,6 +269,28 @@ function clearRemovedLayerSelections(nextLayers: LayerDescriptor[]): void {
   emitAllSelection();
 }
 
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+async function addGraphicsInBatches(
+  layer: any,
+  graphics: any[],
+  batchSize: number,
+  shouldStop?: () => boolean
+): Promise<void> {
+  for (let i = 0; i < graphics.length; i += batchSize) {
+    if (shouldStop?.()) {
+      return;
+    }
+    const batch = graphics.slice(i, i + batchSize);
+    layer.addMany(batch);
+    await nextAnimationFrame();
+  }
+}
+
 async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
   if (!mapRef || !FeatureLayerCtor) {
     return;
@@ -249,6 +301,7 @@ async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
     if (!nextMap.has(layerKey)) {
       mapRef.remove(layerInstance);
       dataLayers.delete(layerKey);
+      defaultRendererByLayer.delete(layerKey);
     }
   }
   clearRemovedLayerSelections(nextLayers);
@@ -256,6 +309,7 @@ async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
   for (const layer of nextLayers) {
     let layerInstance = dataLayers.get(layer.layerKey);
     if (!layerInstance) {
+      const desiredRenderer = rendererForLayer(layer);
       layerInstance = new FeatureLayerCtor({
         url: layer.url,
         outFields: ["*"],
@@ -264,8 +318,29 @@ async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
       });
       mapRef.add(layerInstance, 0);
       dataLayers.set(layer.layerKey, layerInstance);
+      void layerInstance
+        .load()
+        .then(() => {
+          if (!defaultRendererByLayer.has(layer.layerKey)) {
+            defaultRendererByLayer.set(layer.layerKey, layerInstance.renderer?.clone?.() ?? layerInstance.renderer);
+          }
+          if (!desiredRenderer) {
+            return;
+          }
+          layerInstance.renderer = desiredRenderer;
+        })
+        .catch(() => {
+          // ignore renderer bootstrap failures
+        });
     } else {
       layerInstance.visible = layer.visibleByDefault;
+      const renderer = rendererForLayer(layer);
+      if (renderer) {
+        layerInstance.renderer = renderer;
+      } else if (defaultRendererByLayer.has(layer.layerKey)) {
+        const defaultRenderer = defaultRendererByLayer.get(layer.layerKey);
+        layerInstance.renderer = defaultRenderer?.clone?.() ?? defaultRenderer;
+      }
     }
   }
 
@@ -587,26 +662,35 @@ async function initMap(): Promise<void> {
         return;
       }
 
-      const graphics = next
-        .map((feature) => {
-          const geometry = toGraphicGeometry(feature.geometry as Record<string, unknown> | undefined);
-          if (!geometry) {
-            return null;
-          }
-
-          return new GraphicCtor({
+      const graphicsBatch: any[] = [];
+      let rendered = 0;
+      for (const feature of next) {
+        const geometry = toGraphicGeometry(feature.geometry as Record<string, unknown> | undefined);
+        if (!geometry) {
+          continue;
+        }
+        graphicsBatch.push(
+          new GraphicCtor({
             geometry,
             symbol: symbolForGeometryType(String(geometry.type ?? "point")),
             attributes: feature.attributes
-          });
-        })
-        .filter(Boolean);
-
-      if (!graphics.length) {
-        return;
+          })
+        );
+        if (graphicsBatch.length >= 2000) {
+          await addGraphicsInBatches(highlightLayer, graphicsBatch.splice(0, graphicsBatch.length), 2000, () => nonce !== (props.responseNonce ?? 0));
+          if (nonce !== (props.responseNonce ?? 0)) {
+            return;
+          }
+        }
+        rendered += 1;
       }
 
-      highlightLayer.addMany(graphics);
+      if (graphicsBatch.length > 0) {
+        await addGraphicsInBatches(highlightLayer, graphicsBatch, 2000, () => nonce !== (props.responseNonce ?? 0));
+      }
+      if (rendered <= 0) {
+        return;
+      }
       if (nonce !== (props.responseNonce ?? 0)) {
         return;
       }

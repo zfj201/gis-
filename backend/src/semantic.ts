@@ -49,7 +49,7 @@ function parseCoordinate(question: string): { x: number; y: number } | undefined
   return undefined;
 }
 
-function parseTopLimit(question: string): number | undefined {
+function parseTopLimit(question: string, cap: number): number | undefined {
   const topMatch = question.match(/前\s*(\d+)\s*(个|条|家|所)?/);
   if (!topMatch) {
     return undefined;
@@ -60,7 +60,7 @@ function parseTopLimit(question: string): number | undefined {
     return undefined;
   }
 
-  return Math.min(limit, 2000);
+  return Math.min(limit, Math.max(1, cap));
 }
 
 function geometryKindFromLayer(layer: LayerDescriptor): "point" | "line" | "polygon" | "unknown" {
@@ -137,10 +137,58 @@ function inferIntent(question: string): SpatialQueryDSL["intent"] {
   if (/多少|几个|总数|数量/.test(question)) {
     return "count";
   }
+  if (/(最近|nearest)/i.test(question)) {
+    return "nearest";
+  }
   if (/附近|周边|以内|内/.test(question)) {
     return "buffer_search";
   }
   return "search";
+}
+
+function parseNearestClause(
+  question: string
+): {
+  sourcePart: string;
+  targetPart: string;
+} | null {
+  const cleaned = question.trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  const regex = /(.+?)\s*(?:最近的?|nearest)\s*(.+)/i;
+  const match = cleaned.match(regex);
+  if (!match?.[1] || !match[2]) {
+    return null;
+  }
+
+  const sourcePart = match[1].trim();
+  const targetPart = match[2]
+    .replace(/^前\s*\d+\s*(个|条|家|所)?\s*/i, "")
+    .replace(/\s*前\s*\d+\s*(个|条|家|所)?$/i, "")
+    .trim();
+
+  if (!sourcePart || !targetPart) {
+    return null;
+  }
+
+  return { sourcePart, targetPart };
+}
+
+function locationTypeFromHint(
+  hint: "point" | "line" | "polygon" | null
+): "point" | "road" | "subdistrict" | "county" | "unknown" {
+  if (hint === "point") {
+    return "point";
+  }
+  if (hint === "line") {
+    return "road";
+  }
+  if (hint === "polygon") {
+    return "subdistrict";
+  }
+  return "unknown";
 }
 
 function parseKeyword(question: string): string | undefined {
@@ -301,7 +349,7 @@ function createBaseDsl(layerKey: string, fields: string[]): SpatialQueryDSL {
     targetLayer: layerKey,
     attributeFilter: [],
     aggregation: null,
-    limit: 2000,
+    limit: config.queryMaxFeatures,
     output: {
       fields,
       returnGeometry: true
@@ -311,6 +359,179 @@ function createBaseDsl(layerKey: string, fields: string[]): SpatialQueryDSL {
 
 export function parseQuestion(question: string): ParseResponse {
   const normalized = question.trim();
+  const nearestClause = parseNearestClause(normalized);
+  if (nearestClause) {
+    const requestedLimit = parseTopLimit(normalized, config.nearestMaxK);
+    const nearestLimit = requestedLimit ?? Math.max(1, config.nearestDefaultK);
+    const sourceCoordinate = parseCoordinate(nearestClause.sourcePart) ?? parseCoordinate(normalized);
+    const targetHint = geometryHintFromText(nearestClause.targetPart);
+    const targetResolved = chooseLayerByHint(nearestClause.targetPart, targetHint);
+
+    if (!targetResolved.layer) {
+      const fallbackDsl = spatialQueryDslSchema.parse({
+        intent: "nearest",
+        targetLayer: (targetResolved.layer ?? layerRegistry.getDefaultLayer())?.layerKey ?? "fuzhou_parks",
+        attributeFilter: [],
+        aggregation: null,
+        limit: nearestLimit,
+        output: {
+          fields: [],
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "nearest"
+        }
+      });
+      return {
+        dsl: fallbackDsl,
+        confidence: 0.55,
+        followUpQuestion: targetResolved.followUpQuestion ?? "请明确要查询最近邻的目标图层。",
+        parserSource: "rule"
+      };
+    }
+
+    if (sourceCoordinate) {
+      const nearestByCenterDsl = spatialQueryDslSchema.parse({
+        intent: "nearest",
+        targetLayer: targetResolved.layer.layerKey,
+        attributeFilter: [],
+        aggregation: null,
+        limit: nearestLimit,
+        output: {
+          fields: defaultOutputFields(targetResolved.layer),
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "nearest",
+          center: {
+            x: sourceCoordinate.x,
+            y: sourceCoordinate.y,
+            spatialReference: { wkid: 3857 }
+          }
+        },
+        locationEntity: {
+          rawText: `${sourceCoordinate.x},${sourceCoordinate.y}`,
+          type: "point",
+          resolution: "resolved"
+        }
+      });
+      const normalizedResult = normalizeDslByQuestion(normalized, nearestByCenterDsl);
+      return {
+        dsl: normalizedResult.dsl,
+        confidence: 0.9,
+        followUpQuestion: null,
+        parserSource: "rule",
+        normalizedByRule: normalizedResult.normalized
+      };
+    }
+
+    const sourceHint = geometryHintFromText(nearestClause.sourcePart);
+    const sourceResolved = chooseLayerByHint(nearestClause.sourcePart, sourceHint);
+    if (!sourceResolved.layer) {
+      const fallbackDsl = spatialQueryDslSchema.parse({
+        intent: "nearest",
+        targetLayer: targetResolved.layer.layerKey,
+        attributeFilter: [],
+        aggregation: null,
+        limit: nearestLimit,
+        output: {
+          fields: defaultOutputFields(targetResolved.layer),
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "nearest"
+        }
+      });
+      return {
+        dsl: fallbackDsl,
+        confidence: 0.6,
+        followUpQuestion: sourceResolved.followUpQuestion ?? "请明确最近邻的源图层。",
+        parserSource: "rule"
+      };
+    }
+
+    const sourceFilters = extractSourceFilters(nearestClause.sourcePart, sourceResolved.layer);
+    if (!sourceFilters.length) {
+      const noFilterDsl = spatialQueryDslSchema.parse({
+        intent: "nearest",
+        targetLayer: targetResolved.layer.layerKey,
+        attributeFilter: [],
+        aggregation: null,
+        limit: nearestLimit,
+        output: {
+          fields: defaultOutputFields(targetResolved.layer),
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "nearest",
+          sourceLayer: sourceResolved.layer.layerKey,
+          sourceAttributeFilter: []
+        }
+      });
+      return {
+        dsl: noFilterDsl,
+        confidence: 0.68,
+        followUpQuestion: `请明确源要素条件（当前源图层：${sourceResolved.layer.name}），例如“OBJECTID为45854的${sourceResolved.layer.name}最近的${targetResolved.layer.name}”。`,
+        parserSource: "rule"
+      };
+    }
+
+    const nearestDsl = spatialQueryDslSchema.parse({
+      intent: "nearest",
+      targetLayer: targetResolved.layer.layerKey,
+      attributeFilter: [],
+      aggregation: null,
+      limit: nearestLimit,
+      output: {
+        fields: defaultOutputFields(targetResolved.layer),
+        returnGeometry: true
+      },
+      spatialFilter: {
+        type: "nearest",
+        sourceLayer: sourceResolved.layer.layerKey,
+        sourceAttributeFilter: sourceFilters
+      },
+      locationEntity: {
+        rawText: nearestClause.sourcePart,
+        type: locationTypeFromHint(sourceHint),
+        resolution: "resolved"
+      }
+    });
+    const normalizedResult = normalizeDslByQuestion(normalized, nearestDsl);
+    return {
+      dsl: normalizedResult.dsl,
+      confidence: 0.88,
+      followUpQuestion: null,
+      parserSource: "rule",
+      normalizedByRule: normalizedResult.normalized
+    };
+  }
+  if (/(最近|nearest)/i.test(normalized)) {
+    const targetResolved = resolveTargetLayer(normalized);
+    const fallbackLayer = targetResolved.layer ?? layerRegistry.getDefaultLayer();
+    const fallbackDsl = spatialQueryDslSchema.parse({
+      intent: "nearest",
+      targetLayer: fallbackLayer?.layerKey ?? "fuzhou_parks",
+      attributeFilter: [],
+      aggregation: null,
+      limit: Math.max(1, config.nearestDefaultK),
+      output: {
+        fields: fallbackLayer ? defaultOutputFields(fallbackLayer) : [],
+        returnGeometry: true
+      },
+      spatialFilter: {
+        type: "nearest"
+      }
+    });
+    return {
+      dsl: fallbackDsl,
+      confidence: 0.55,
+      followUpQuestion:
+        "最近邻查询需要明确源对象。请提供坐标，或按“OBJECTID为45854的宗地院落最近的道路街巷”这样的格式提问。",
+      parserSource: "rule"
+    };
+  }
+
   const crossLayer = parseCrossLayerBuffer(normalized);
   if (crossLayer && !parseCoordinate(normalized)) {
     const sourceHint = geometryHintFromText(crossLayer.sourcePart);
@@ -328,7 +549,7 @@ export function parseQuestion(question: string): ParseResponse {
         targetLayer: (targetResolved.layer ?? layerRegistry.getDefaultLayer())?.layerKey ?? "fuzhou_parks",
         attributeFilter: [],
         aggregation: null,
-        limit: 2000,
+        limit: config.queryMaxFeatures,
         output: {
           fields: [],
           returnGeometry: true
@@ -354,7 +575,7 @@ export function parseQuestion(question: string): ParseResponse {
         targetLayer: targetResolved.layer.layerKey,
         attributeFilter: [],
         aggregation: null,
-        limit: 2000,
+        limit: config.queryMaxFeatures,
         output: {
           fields: defaultOutputFields(targetResolved.layer),
           returnGeometry: true
@@ -380,7 +601,7 @@ export function parseQuestion(question: string): ParseResponse {
       targetLayer: targetResolved.layer.layerKey,
       attributeFilter: [],
       aggregation: null,
-      limit: 2000,
+      limit: config.queryMaxFeatures,
       output: {
         fields: defaultOutputFields(targetResolved.layer),
         returnGeometry: true
@@ -441,7 +662,9 @@ export function parseQuestion(question: string): ParseResponse {
   const intent = inferIntent(normalized);
   const radiusMeters = parseRadiusMeters(normalized);
   const coordinate = parseCoordinate(normalized);
-  const limit = parseTopLimit(normalized) ?? 2000;
+  const limit =
+    parseTopLimit(normalized, intent === "nearest" ? config.nearestMaxK : config.queryMaxFeatures) ??
+    (intent === "nearest" ? Math.max(1, config.nearestDefaultK) : config.queryMaxFeatures);
   const county = normalized.match(countyPattern)?.[1];
   const keyword = parseKeyword(normalized);
   const countyField = findCountyField(fallbackLayer);

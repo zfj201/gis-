@@ -286,7 +286,7 @@ body {
   border-radius: 8px;
   background: #fff;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   padding: 7px 9px;
@@ -322,6 +322,11 @@ body {
   flex: 1;
 }
 
+.layer-item-main {
+  min-width: 0;
+  flex: 1;
+}
+
 .layer-name {
   font-size: 13px;
   color: #203a5f;
@@ -331,8 +336,20 @@ body {
 }
 
 .layer-item small {
+  display: block;
+  margin-top: 4px;
   color: #5b7594;
   flex: 0 0 auto;
+}
+
+.heatmap-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #355578;
+  font-size: 11px;
+  flex: 0 0 auto;
+  padding-top: 2px;
 }
 
 .danger-btn {

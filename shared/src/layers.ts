@@ -26,6 +26,7 @@ export const layerDescriptorSchema = z.object({
   displayField: z.string().min(1),
   fields: z.array(layerFieldSchema).default([]),
   visibleByDefault: z.boolean().default(true),
+  pointRenderMode: z.enum(["default", "heatmap"]).optional(),
   queryable: z.boolean().default(true),
   aliases: z.array(z.string().min(1)).default([])
 });

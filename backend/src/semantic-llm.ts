@@ -104,7 +104,7 @@ function hasCountyFilter(dsl: SpatialQueryDSL): boolean {
   );
 }
 
-function parseRequestedTopLimit(question: string): number | undefined {
+function parseRequestedTopLimit(question: string, cap: number): number | undefined {
   const topMatch = question.match(/前\s*(\d+)\s*(个|条|家|所)?/);
   if (!topMatch) {
     return undefined;
@@ -115,7 +115,7 @@ function parseRequestedTopLimit(question: string): number | undefined {
     return undefined;
   }
 
-  return Math.min(limit, 2000);
+  return Math.min(limit, Math.max(1, cap));
 }
 
 function normalizeLimitByQuestion(question: string, dsl: SpatialQueryDSL): SpatialQueryDSL {
@@ -123,10 +123,18 @@ function normalizeLimitByQuestion(question: string, dsl: SpatialQueryDSL): Spati
     return dsl;
   }
 
-  const requestedLimit = parseRequestedTopLimit(question);
+  if (dsl.intent === "nearest") {
+    const requestedNearest = parseRequestedTopLimit(question, config.nearestMaxK);
+    return {
+      ...dsl,
+      limit: requestedNearest ?? Math.max(1, config.nearestDefaultK)
+    };
+  }
+
+  const requestedLimit = parseRequestedTopLimit(question, config.queryMaxFeatures);
   return {
     ...dsl,
-    limit: requestedLimit ?? 2000
+    limit: requestedLimit ?? config.queryMaxFeatures
   };
 }
 
@@ -315,7 +323,7 @@ function normalizeLimit(raw: unknown): number {
   if (Number.isNaN(parsed) || parsed <= 0) {
     return 20;
   }
-  return Math.min(2000, Math.max(1, Math.round(parsed)));
+  return Math.min(config.queryMaxFeatures, Math.max(1, Math.round(parsed)));
 }
 
 function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
@@ -471,6 +479,19 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
 
   if (isCountIntentText(question)) {
     if (dsl.intent !== "count" && dsl.aggregation?.type !== "count") {
+      return false;
+    }
+  }
+
+  if (/(最近|nearest)/i.test(question) && dsl.intent !== "nearest") {
+    return false;
+  }
+  if (dsl.intent === "nearest") {
+    const hasCenter = Boolean(dsl.spatialFilter?.center);
+    const hasSource = Boolean(
+      dsl.spatialFilter?.sourceLayer && dsl.spatialFilter?.sourceAttributeFilter?.length
+    );
+    if (!hasCenter && !hasSource) {
       return false;
     }
   }

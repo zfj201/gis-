@@ -79,7 +79,7 @@ export const spatialQueryDslSchema = z.object({
       order: z.enum(["asc", "desc"])
     })
     .optional(),
-  limit: z.number().int().positive().max(2000).default(20),
+  limit: z.number().int().positive().max(500000).default(20),
   output: z.object({
     fields: z.array(z.string()).default([]),
     returnGeometry: z.boolean().default(true)
@@ -115,6 +115,15 @@ export interface QueryPlan {
   returnCountOnly?: boolean;
   groupByFieldsForStatistics?: string;
   outStatistics?: string;
+  analysisType?: "nearest";
+  nearestMeta?: {
+    topK: number;
+    sourceMode: "center" | "source_layer";
+    sourceLayer?: string;
+    sourceObjectId?: string;
+    radiusUsedMeters: number;
+    candidateCount: number;
+  };
 }
 
 export interface ExecuteResponse {
@@ -123,6 +132,12 @@ export interface ExecuteResponse {
   features: Array<Record<string, unknown>>;
   summary: string;
   followUpQuestion: string | null;
+  executionMeta?: {
+    truncated: boolean;
+    safetyCap: number;
+    fetched: number;
+    requestedLimit: number;
+  };
   parserSource?: ParserSource;
   parserFailureReason?: string;
   parserFailureDetail?: string;

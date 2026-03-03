@@ -271,6 +271,9 @@ export class LayerRegistry {
           displayField,
           fields,
           visibleByDefault: true,
+          pointRenderMode: /point/i.test(String(layerMeta.geometryType ?? layerDef.geometryType ?? ""))
+            ? "default"
+            : undefined,
           queryable: true,
           aliases: uniqueValues(aliases)
         });
@@ -308,7 +311,7 @@ export class LayerRegistry {
 
   async updateLayerFlags(
     layerKey: string,
-    flags: { visibleByDefault?: boolean; queryable?: boolean }
+    flags: { visibleByDefault?: boolean; queryable?: boolean; pointRenderMode?: "default" | "heatmap" }
   ): Promise<LayerDescriptor> {
     const layer = this.state.layers.find((item) => item.layerKey === layerKey);
     if (!layer) {
@@ -320,6 +323,12 @@ export class LayerRegistry {
     }
     if (typeof flags.queryable === "boolean") {
       layer.queryable = flags.queryable;
+    }
+    if (flags.pointRenderMode) {
+      if (!/point/i.test(layer.geometryType)) {
+        throw new UserFacingError(`图层“${layer.name}”不是点图层，不能设置热力图模式。`);
+      }
+      layer.pointRenderMode = flags.pointRenderMode;
     }
 
     this.touch();
@@ -334,7 +343,17 @@ export class LayerRegistry {
       this.state = {
         version: Number(parsed.version ?? 1),
         services: Array.isArray(parsed.services) ? parsed.services : [],
-        layers: Array.isArray(parsed.layers) ? parsed.layers : [],
+        layers: Array.isArray(parsed.layers)
+          ? parsed.layers.map((layer) => {
+              const geometryType = String((layer as LayerDescriptor).geometryType ?? "");
+              return {
+                ...(layer as LayerDescriptor),
+                pointRenderMode: /point/i.test(geometryType)
+                  ? ((layer as LayerDescriptor).pointRenderMode ?? "default")
+                  : undefined
+              };
+            })
+          : [],
         updatedAt: parsed.updatedAt ?? new Date().toISOString()
       };
     } catch (error) {
@@ -411,6 +430,7 @@ export class LayerRegistry {
             { name: "区县", alias: "区县", type: "esriFieldTypeString", queryable: true }
           ],
           visibleByDefault: true,
+          pointRenderMode: "default",
           queryable: true,
           aliases: ["fuzhou_parks", "福州市公园点", "公园"]
         }

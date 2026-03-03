@@ -38,7 +38,10 @@ function buildVisualizationDsl(
 
   if (dsl.intent === "count" || dsl.aggregation?.type === "count") {
     const count = Number(payload.count ?? 0);
-    const visualLimit = Math.min(Math.max(0, Number.isFinite(count) ? count : 0), 2000);
+    const visualLimit = Math.min(
+      Math.max(0, Number.isFinite(count) ? count : 0),
+      Math.max(1, config.queryMaxFeatures)
+    );
     if (visualLimit <= 0) {
       return null;
     }
@@ -61,7 +64,7 @@ function buildVisualizationDsl(
     targetLayer: targetLayer.layerKey,
     intent: "search",
     aggregation: null,
-    limit: 2000,
+    limit: Math.max(1, config.queryMaxFeatures),
     output: {
       fields: baseOutputFields,
       returnGeometry: true
@@ -203,18 +206,29 @@ app.delete<{ Params: { serviceId: string } }>(
   }
 );
 
-app.patch<{ Params: { layerKey: string }; Body: { visibleByDefault?: boolean; queryable?: boolean } }>(
+app.patch<{
+  Params: { layerKey: string };
+  Body: { visibleByDefault?: boolean; queryable?: boolean; pointRenderMode?: "default" | "heatmap" };
+}>(
   "/api/layers/catalog/layer/:layerKey",
   async (req, reply) => {
-    const { visibleByDefault, queryable } = req.body ?? {};
-    if (typeof visibleByDefault !== "boolean" && typeof queryable !== "boolean") {
-      return reply.code(400).send({ message: "至少提供 visibleByDefault 或 queryable 的一个布尔值。" });
+    const { visibleByDefault, queryable, pointRenderMode } = req.body ?? {};
+    if (
+      typeof visibleByDefault !== "boolean" &&
+      typeof queryable !== "boolean" &&
+      pointRenderMode !== "default" &&
+      pointRenderMode !== "heatmap"
+    ) {
+      return reply.code(400).send({
+        message: "至少提供 visibleByDefault、queryable 或 pointRenderMode（default|heatmap）之一。"
+      });
     }
 
     try {
       const layer = await layerRegistry.updateLayerFlags(req.params.layerKey, {
         visibleByDefault,
-        queryable
+        queryable,
+        pointRenderMode
       });
       return {
         layer,
@@ -392,6 +406,7 @@ app.post<{ Body: { dsl: SpatialQueryDSL } }>("/api/spatial/execute", async (req,
     const executed = await executeDsl(result.data);
     const plan = executed.plan;
     const payload = executed.payload;
+    let executionMeta = executed.executionMeta;
     let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
 
     if (typeof payload.count === "number" || result.data.intent === "group_stat") {
@@ -399,6 +414,7 @@ app.post<{ Body: { dsl: SpatialQueryDSL } }>("/api/spatial/execute", async (req,
       if (visualDsl) {
         const visualExecuted = await executeDsl(visualDsl);
         const visualPayload = visualExecuted.payload;
+        executionMeta = visualExecuted.executionMeta ?? executionMeta;
         features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
       } else {
         features = [];
@@ -411,6 +427,7 @@ app.post<{ Body: { dsl: SpatialQueryDSL } }>("/api/spatial/execute", async (req,
       features,
       summary: summarizeResult(result.data, payload, layerName),
       followUpQuestion: null,
+      executionMeta,
       parserSource: "rule",
       targetLayerName: layerName
     };
@@ -473,6 +490,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
     const executed = await executeDsl(parsed.dsl);
     const plan = executed.plan;
     const payload = executed.payload;
+    let executionMeta = executed.executionMeta;
     let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
 
     if (typeof payload.count === "number" || parsed.dsl.intent === "group_stat") {
@@ -480,6 +498,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       if (visualDsl) {
         const visualExecuted = await executeDsl(visualDsl);
         const visualPayload = visualExecuted.payload;
+        executionMeta = visualExecuted.executionMeta ?? executionMeta;
         features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
       } else {
         features = [];
@@ -493,6 +512,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       features,
       summary: summarizeResult(parsed.dsl, payload, layerName),
       followUpQuestion: parsed.followUpQuestion,
+      executionMeta,
       parserSource: parsed.parserSource,
       parserFailureReason: parsed.parserFailureReason ?? null,
       parserFailureDetail: parsed.parserFailureDetail ?? null,

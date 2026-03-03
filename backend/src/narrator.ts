@@ -64,6 +64,18 @@ export function summarizeResult(
     return `按${groupField}统计：${parts.join("，")}。`;
   }
 
+  if (dsl.intent === "nearest") {
+    const features = (payload.features as Array<{ attributes?: Record<string, unknown> }>) ?? [];
+    if (features.length === 0) {
+      return `未检索到符合条件的${layerName}。`;
+    }
+    const nearest = features[0];
+    const nearestLabel = pickFeatureLabel(nearest.attributes);
+    const nearestDistance = Number(nearest.attributes?._nearest_distance_m ?? NaN);
+    const distanceText = Number.isFinite(nearestDistance) ? `，最近距离约 ${nearestDistance.toFixed(2)} 米` : "";
+    return `共检索到 ${features.length} 个${layerName}${distanceText}，最近要素：${nearestLabel}。`;
+  }
+
   const features = (payload.features as Array<{ attributes?: Record<string, unknown> }>) ?? [];
   if (features.length === 0) {
     return `未检索到符合条件的${layerName}。`;
