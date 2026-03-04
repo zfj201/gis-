@@ -452,7 +452,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
     return reply.code(400).send({ message: "question 不能为空" });
   }
 
-  if (!isSpatialQuestion(question)) {
+  if (!(await isSpatialQuestion(question))) {
     const general = await answerGeneralQuestion(question);
     return {
       dsl: null,
@@ -468,7 +468,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
     };
   }
 
-  const parsed = await parseQuestionSmart(question);
+  const parsed = await parseQuestionSmart(question, { assumeSpatial: true });
   if (parsed.followUpQuestion) {
     return {
       dsl: parsed.dsl,

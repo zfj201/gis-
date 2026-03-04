@@ -56,6 +56,8 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     `nearest 的 limit 必须 <= ${nearestMax}；若用户未明确“前N”，默认设为 ${nearestDefault}。`,
     "buffer_search 需要 radius + unit(meter/kilometer)。",
     "nearest 需要可解析的源要素：要么 spatialFilter.center（坐标），要么 sourceLayer+sourceAttributeFilter（单源）。",
+    "nearest 默认 attributeFilter=[]；仅当目标部分有明确字段条件时才允许设置目标过滤。",
+    "坐标类问句中的 x/y 是坐标参数，不是属性字段，禁止生成 field=x 或 field=y 过滤。",
     "字段名只能使用目标图层（或 sourceLayer）的可查询字段，不得自造字段。",
     "数值比较（> >= < <=）不得使用 like。",
     "统计问句（多少/几个/总数/数量）默认不注入“有多少个”等噪音过滤词。"
@@ -76,7 +78,8 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "【第5段：跨图层缓冲硬约束】",
     "若问句是“某条线/某个面 X米内 的 另一图层”，必须填 spatialFilter.sourceLayer + spatialFilter.sourceAttributeFilter。",
     "跨图层缓冲严禁伪造 spatialFilter.center。",
-    "显式坐标（如 x:13303000,y:2996000）+ 附近语义时，才允许使用 spatialFilter.center，默认 wkid=3857。"
+    "显式坐标（如 x:13303000,y:2996000）+ 附近语义时，才允许使用 spatialFilter.center，默认 wkid=3857。",
+    "若为“源要素 最近 目标要素”，source 条件只能写在 spatialFilter.sourceAttributeFilter，不能写到目标 attributeFilter。"
   ].join("\n");
 
   const section6 = [
@@ -361,6 +364,36 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           attributeFilter: [],
           aggregation: null,
           limit: Math.max(1, config.nearestDefaultK),
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "OBJECTID:45854的宗地院落最近的门牌号码前五个"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "nearest",
+          targetLayer: doorplateLayerKey,
+          locationEntity: {
+            rawText: "OBJECTID:45854的宗地院落",
+            type: "subdistrict",
+            resolution: "resolved"
+          },
+          spatialFilter: {
+            type: "nearest",
+            sourceLayer: parcelLayerKey,
+            sourceAttributeFilter: [{ field: "objectid", operator: "=", value: "45854" }]
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: 5,
           output: { fields: [], returnGeometry: true }
         }
       })

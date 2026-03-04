@@ -6,6 +6,7 @@ import {
 } from "@gis/shared";
 import { config } from "./config.js";
 import { buildCandidateLayerText, layerRegistry } from "./layer-registry.js";
+import { parseTopLimitFromQuestion, stripTopLimitPhrase } from "./semantic-limit.js";
 import { inferMatchPreference, normalizeDslByQuestion } from "./semantic-normalizer.js";
 import { defaultOutputFields, findCountyField, findNameField, resolveTargetLayer } from "./semantic-routing.js";
 
@@ -47,20 +48,6 @@ function parseCoordinate(question: string): { x: number; y: number } | undefined
     }
   }
   return undefined;
-}
-
-function parseTopLimit(question: string, cap: number): number | undefined {
-  const topMatch = question.match(/前\s*(\d+)\s*(个|条|家|所)?/);
-  if (!topMatch) {
-    return undefined;
-  }
-
-  const limit = Number(topMatch[1]);
-  if (Number.isNaN(limit) || limit < 1) {
-    return undefined;
-  }
-
-  return Math.min(limit, Math.max(1, cap));
 }
 
 function geometryKindFromLayer(layer: LayerDescriptor): "point" | "line" | "polygon" | "unknown" {
@@ -168,10 +155,7 @@ function parseNearestClause(
   }
 
   const sourcePart = match[1].trim();
-  const targetPart = match[2]
-    .replace(/^前\s*\d+\s*(个|条|家|所)?\s*/i, "")
-    .replace(/\s*前\s*\d+\s*(个|条|家|所)?$/i, "")
-    .trim();
+  const targetPart = stripTopLimitPhrase(match[2].trim());
 
   if (!sourcePart || !targetPart) {
     return null;
@@ -365,7 +349,7 @@ export function parseQuestion(question: string): ParseResponse {
   const normalized = question.trim();
   const nearestClause = parseNearestClause(normalized);
   if (nearestClause) {
-    const requestedLimit = parseTopLimit(normalized, config.nearestMaxK);
+    const requestedLimit = parseTopLimitFromQuestion(normalized, config.nearestMaxK);
     const nearestLimit = requestedLimit ?? Math.max(1, config.nearestDefaultK);
     const sourceCoordinate = parseCoordinate(nearestClause.sourcePart) ?? parseCoordinate(normalized);
     const targetHint = geometryHintFromText(nearestClause.targetPart);
@@ -670,7 +654,7 @@ export function parseQuestion(question: string): ParseResponse {
     intent === "buffer_search" && coordinate && /(附近|周边|以内|内)/.test(normalized)
   );
   const limit =
-    parseTopLimit(normalized, intent === "nearest" ? config.nearestMaxK : config.queryMaxFeatures) ??
+    parseTopLimitFromQuestion(normalized, intent === "nearest" ? config.nearestMaxK : config.queryMaxFeatures) ??
     (intent === "nearest" ? Math.max(1, config.nearestDefaultK) : config.queryMaxFeatures);
   const county = normalized.match(countyPattern)?.[1];
   const keyword = parseKeyword(normalized);

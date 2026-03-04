@@ -16,8 +16,13 @@ import {
   classifyModelFailureReason,
   normalizeDslByQuestion
 } from "./semantic-normalizer.js";
+import { parseTopLimitFromQuestion } from "./semantic-limit.js";
 import { parseQuestion as parseQuestionByRules } from "./semantic.js";
 import { defaultOutputFields, findCountyField, resolveTargetLayer } from "./semantic-routing.js";
+import {
+  evaluateSpatialIntentGate,
+  type SpatialGateDecision
+} from "./spatial-intent-gate.js";
 
 interface LlmSemanticOutput {
   actionable: boolean;
@@ -47,6 +52,19 @@ interface OpenAIMessage {
   content: string;
 }
 
+interface SpatialIntentClassificationOutput {
+  isSpatial: boolean;
+  confidence?: number;
+  reason?: string;
+}
+
+interface SpatialIntentDecision {
+  isSpatial: boolean;
+  gateScore: number;
+  gateDecision: SpatialGateDecision;
+  gateReason: string;
+}
+
 type SemanticOutputIssueKind = "schema" | "non_json" | "consistency";
 
 interface SemanticCompletionResult {
@@ -64,12 +82,6 @@ class SemanticOutputError extends Error {
     this.kind = kind;
     this.rawOutput = rawOutput;
   }
-}
-
-function hasSpatialSignal(question: string): boolean {
-  return /(公园|区县|县|街道|附近|周边|坐标|经纬|公里|千米|米|统计|查询|查找|地图|点位|范围|最近|缓冲|地址|城市|poi|distance|buffer|门牌|道路|房屋|建筑|图层|多少|几个|总数|数量)/i.test(
-    question
-  );
 }
 
 function hasCoordinateText(question: string): boolean {
@@ -117,34 +129,20 @@ function hasCountyFilter(dsl: SpatialQueryDSL): boolean {
   );
 }
 
-function parseRequestedTopLimit(question: string, cap: number): number | undefined {
-  const topMatch = question.match(/前\s*(\d+)\s*(个|条|家|所)?/);
-  if (!topMatch) {
-    return undefined;
-  }
-
-  const limit = Number(topMatch[1]);
-  if (Number.isNaN(limit) || limit < 1) {
-    return undefined;
-  }
-
-  return Math.min(limit, Math.max(1, cap));
-}
-
 function normalizeLimitByQuestion(question: string, dsl: SpatialQueryDSL): SpatialQueryDSL {
   if (!["search", "buffer_search", "nearest"].includes(dsl.intent)) {
     return dsl;
   }
 
   if (dsl.intent === "nearest") {
-    const requestedNearest = parseRequestedTopLimit(question, config.nearestMaxK);
+    const requestedNearest = parseTopLimitFromQuestion(question, config.nearestMaxK);
     return {
       ...dsl,
       limit: requestedNearest ?? Math.max(1, config.nearestDefaultK)
     };
   }
 
-  const requestedLimit = parseRequestedTopLimit(question, config.queryMaxFeatures);
+  const requestedLimit = parseTopLimitFromQuestion(question, config.queryMaxFeatures);
   return {
     ...dsl,
     limit: requestedLimit ?? config.queryMaxFeatures
@@ -186,6 +184,25 @@ function createDefaultDsl(): SpatialQueryDSL {
       returnGeometry: true
     }
   };
+}
+
+function createNonSpatialParseResponse(): ParseResponse {
+  return {
+    dsl: createDefaultDsl(),
+    confidence: 0.4,
+    followUpQuestion:
+      "这条消息更像普通对话，不会执行空间检索。你可以继续提空间问题，例如“鼓楼区公园有多少个”。",
+    parserSource: "rule"
+  };
+}
+
+function getQueryableLayers() {
+  return layerRegistry.listCatalog().layers.filter((layer) => layer.queryable);
+}
+
+function computeSpatialGate(question: string) {
+  const layers = getQueryableLayers();
+  return evaluateSpatialIntentGate(question, layers);
 }
 
 function clampConfidence(value: number | undefined): number {
@@ -548,7 +565,8 @@ function normalizeModelOutput(
 
   const parsed = normalizeDslForSchemaAndParse(output.dsl);
   const parsedWithLegacy = normalizeDslForSchemaLegacy(parsed);
-  if (isUnconstrainedSearch(parsedWithLegacy) && !hasSpatialSignal(question)) {
+  const gate = computeSpatialGate(question);
+  if (isUnconstrainedSearch(parsedWithLegacy) && gate.decision === "non_spatial") {
     return {
       dsl: createDefaultDsl(),
       confidence: 0.4,
@@ -607,6 +625,223 @@ function normalizeModelOutput(
     parserSource,
     normalizedByRule: normalizedByRule.normalized
   };
+}
+
+function normalizeSpatialClassifierOutput(raw: string): SpatialIntentClassificationOutput {
+  const jsonText = extractJsonString(raw);
+  const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+  const rawSpatial = parsed.isSpatial;
+  let isSpatial = false;
+  if (typeof rawSpatial === "boolean") {
+    isSpatial = rawSpatial;
+  } else {
+    const normalized = String(rawSpatial ?? "")
+      .trim()
+      .toLowerCase();
+    isSpatial = ["true", "yes", "spatial", "1", "是"].includes(normalized);
+  }
+  const confidenceRaw = Number(parsed.confidence ?? 0.6);
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.max(0, Math.min(1, confidenceRaw))
+    : 0.6;
+  const reason = String(parsed.reason ?? "").trim();
+  return {
+    isSpatial,
+    confidence,
+    reason
+  };
+}
+
+function buildSpatialClassifierMessages(question: string): OpenAIMessage[] {
+  const layers = getQueryableLayers();
+  const layerHints = layers
+    .slice(0, 12)
+    .map((layer) => {
+      const fields = layer.fields
+        .filter((field) => field.queryable)
+        .slice(0, 6)
+        .map((field) => field.name)
+        .join(",");
+      return `${layer.name}[${layer.layerKey}](${fields})`;
+    })
+    .join("; ");
+
+  const system = [
+    "你是空间问题分类器。",
+    "任务：判断用户问题是否属于可执行的 GIS 空间查询。",
+    "只输出 JSON：{\"isSpatial\": boolean, \"confidence\": number, \"reason\": string}",
+    "当问题是普通寒暄/生活问答/与图层无关对话时，isSpatial=false。",
+    "当问题涉及图层要素、字段过滤、统计、最近邻、缓冲、空间关系时，isSpatial=true。",
+    `可查询图层参考：${layerHints || "暂无图层"}`
+  ].join("\n");
+
+  return [
+    { role: "system", content: system },
+    { role: "user", content: question }
+  ];
+}
+
+async function classifySpatialIntentWithProvider(
+  question: string,
+  provider: OpenAICompatibleConfig,
+  deadlineAt: number
+): Promise<{ result: SpatialIntentClassificationOutput; parserSource: ParserSource }> {
+  const messages = buildSpatialClassifierMessages(question);
+  const completion = await requestSemanticCompletion(provider, messages, true, deadlineAt);
+  const result = normalizeSpatialClassifierOutput(completion.content);
+  return {
+    result,
+    parserSource: provider.parserSource
+  };
+}
+
+async function classifySpatialIntentByModel(question: string): Promise<SpatialIntentClassificationOutput> {
+  const provider = config.llmProvider.trim().toLowerCase();
+  const deadlineAt = Date.now() + 18_000;
+
+  if (provider === "gemini") {
+    try {
+      const classified = await classifySpatialIntentWithProvider(
+        question,
+        {
+          providerName: "gemini",
+          parserSource: "gemini",
+          apiKey: config.geminiApiKey,
+          baseUrl: config.geminiBaseUrl,
+          model: config.geminiModel,
+          timeoutMs: Math.min(config.geminiTimeoutMs, 9000),
+          maxAttempts: 2
+        },
+        deadlineAt
+      );
+      return classified.result;
+    } catch (geminiError) {
+      console.warn("[semantic-gate] Gemini 二判失败，尝试 OpenRouter", {
+        raw: (geminiError as Error).message
+      });
+      const candidates = buildModelCandidates(config.openrouterModel, config.openrouterFallbackModels);
+      let lastError: unknown = geminiError;
+      for (const model of candidates) {
+        try {
+          const classified = await classifySpatialIntentWithProvider(
+            question,
+            {
+              providerName: "openrouter",
+              parserSource: "openrouter",
+              apiKey: config.openrouterApiKey,
+              baseUrl: config.openrouterBaseUrl,
+              model,
+              timeoutMs: Math.min(config.openrouterTimeoutMs, 9000),
+              maxAttempts: 1,
+              extraHeaders: {
+                ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+                "X-Title": config.openrouterAppName
+              }
+            },
+            deadlineAt
+          );
+          return classified.result;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError;
+    }
+  }
+
+  if (provider === "openrouter") {
+    const candidates = buildModelCandidates(config.openrouterModel, config.openrouterFallbackModels);
+    let lastError: unknown = null;
+    for (const model of candidates) {
+      try {
+        const classified = await classifySpatialIntentWithProvider(
+          question,
+          {
+            providerName: "openrouter",
+            parserSource: "openrouter",
+            apiKey: config.openrouterApiKey,
+            baseUrl: config.openrouterBaseUrl,
+            model,
+            timeoutMs: Math.min(config.openrouterTimeoutMs, 9000),
+            maxAttempts: 1,
+            extraHeaders: {
+              ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+              "X-Title": config.openrouterAppName
+            }
+          },
+          deadlineAt
+        );
+        return classified.result;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("OpenRouter 二判失败");
+  }
+
+  if (provider === "groq") {
+    const classified = await classifySpatialIntentWithProvider(
+      question,
+      {
+        providerName: "groq",
+        parserSource: "groq",
+        apiKey: config.groqApiKey,
+        baseUrl: config.groqBaseUrl,
+        model: config.groqModel,
+        timeoutMs: Math.min(config.groqTimeoutMs, 9000),
+        maxAttempts: 2
+      },
+      deadlineAt
+    );
+    return classified.result;
+  }
+
+  throw new Error(`LLM_PROVIDER=${provider} 不支持模型二判`);
+}
+
+async function detectSpatialIntentDecision(question: string): Promise<SpatialIntentDecision> {
+  const gate = computeSpatialGate(question);
+  const gateReason = gate.reasons.slice(0, 4).join(" | ") || "无命中信号";
+  if (gate.decision === "spatial") {
+    return {
+      isSpatial: true,
+      gateScore: gate.score,
+      gateDecision: gate.decision,
+      gateReason
+    };
+  }
+  if (gate.decision === "non_spatial") {
+    return {
+      isSpatial: false,
+      gateScore: gate.score,
+      gateDecision: gate.decision,
+      gateReason
+    };
+  }
+
+  try {
+    const secondPass = await classifySpatialIntentByModel(question);
+    return {
+      isSpatial: secondPass.isSpatial,
+      gateScore: gate.score,
+      gateDecision: gate.decision,
+      gateReason: `${gateReason}; 模型二判=${secondPass.isSpatial ? "spatial" : "non_spatial"}${
+        secondPass.reason ? `(${secondPass.reason})` : ""
+      }`
+    };
+  } catch (error) {
+    console.warn("[semantic-gate] 模型二判失败，默认按空间问题处理", {
+      gateScore: gate.score,
+      gateDecision: gate.decision,
+      reason: (error as Error).message
+    });
+    return {
+      isSpatial: true,
+      gateScore: gate.score,
+      gateDecision: gate.decision,
+      gateReason: `${gateReason}; 模型二判失败默认空间`
+    };
+  }
 }
 
 function withParserSource(parsed: ParseResponse, parserSource: ParserSource): ParseResponse {
@@ -1006,19 +1241,32 @@ async function chatWithOpenAICompatible(
   }
 }
 
-export function isSpatialQuestion(question: string): boolean {
-  return hasSpatialSignal(question.trim());
+export async function isSpatialQuestion(question: string): Promise<boolean> {
+  const decision = await detectSpatialIntentDecision(question.trim());
+  console.info("[semantic-gate] decision", {
+    gateScore: decision.gateScore,
+    gateDecision: decision.gateDecision,
+    gateReason: decision.gateReason,
+    isFallback: false
+  });
+  return decision.isSpatial;
 }
 
-export async function parseQuestionSmart(question: string): Promise<ParseResponse> {
-  if (!isSpatialQuestion(question)) {
-    return {
-      dsl: createDefaultDsl(),
-      confidence: 0.4,
-      followUpQuestion:
-        "这条消息更像普通对话，不会执行空间检索。你可以继续提空间问题，例如“鼓楼区公园有多少个”。",
-      parserSource: "rule"
-    };
+export async function parseQuestionSmart(
+  question: string,
+  options?: { assumeSpatial?: boolean }
+): Promise<ParseResponse> {
+  if (!options?.assumeSpatial) {
+    const gateDecision = await detectSpatialIntentDecision(question);
+    console.info("[semantic-gate] decision", {
+      gateScore: gateDecision.gateScore,
+      gateDecision: gateDecision.gateDecision,
+      gateReason: gateDecision.gateReason,
+      isFallback: false
+    });
+    if (!gateDecision.isSpatial) {
+      return createNonSpatialParseResponse();
+    }
   }
 
   const provider = config.llmProvider.trim().toLowerCase();
@@ -1036,7 +1284,8 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
         provider: "gemini",
         raw: (error as Error).message,
         normalizedReason: reason,
-        detail
+        detail,
+        isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
       return {
@@ -1065,7 +1314,8 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
         provider: "groq",
         raw: (error as Error).message,
         normalizedReason: reason,
-        detail
+        detail,
+        isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
       return {
@@ -1086,7 +1336,8 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
         provider: "openrouter",
         raw: (error as Error).message,
         normalizedReason: reason,
-        detail
+        detail,
+        isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
       return {

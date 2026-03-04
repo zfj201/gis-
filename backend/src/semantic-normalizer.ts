@@ -258,6 +258,42 @@ function hasCoordinateHint(question: string): boolean {
   );
 }
 
+function extractNearestTargetPart(question: string): string | null {
+  const match = question.trim().match(/(.+?)\s*(?:最近的?|nearest)\s*(.+)/i);
+  if (!match?.[2]) {
+    return null;
+  }
+  return match[2].trim();
+}
+
+function normalizeNearestFiltersByQuestion(
+  question: string,
+  dsl: SpatialQueryDSL,
+  layer: LayerDescriptor
+): SpatialQueryDSL {
+  if (dsl.intent !== "nearest") {
+    return dsl;
+  }
+
+  const targetPart = extractNearestTargetPart(question) ?? question;
+  const explicitTarget = extractFieldCondition(targetPart, layer);
+
+  const filters = explicitTarget
+    ? [
+        {
+          field: explicitTarget.field,
+          operator: explicitTarget.operator,
+          value: explicitTarget.value
+        }
+      ]
+    : [];
+
+  return {
+    ...dsl,
+    attributeFilter: filters
+  };
+}
+
 function applyOperatorHint(
   question: string,
   dsl: SpatialQueryDSL,
@@ -287,6 +323,7 @@ function normalizeFilterValues(
   question: string,
   layer: LayerDescriptor
 ): SpatialQueryDSL {
+  const nearestSafeDsl = normalizeNearestFiltersByQuestion(question, dsl, layer);
   const allowedFields = new Set(layer.fields.filter((field) => field.queryable).map((field) => field.name));
   const nameLikeFields = new Set(
     layer.fields
@@ -294,7 +331,7 @@ function normalizeFilterValues(
       .map((field) => field.name)
   );
 
-  const normalizedFilters = dsl.attributeFilter.map((filter) => {
+  const normalizedFilters = nearestSafeDsl.attributeFilter.map((filter) => {
     const resolvedField = resolveFieldName(filter.field, layer) ?? filter.field;
     if (!allowedFields.has(resolvedField)) {
       throw new UserFacingError(`字段 ${filter.field} 不存在于目标图层 ${layer.name}。`, {
@@ -330,16 +367,16 @@ function normalizeFilterValues(
     (item): item is NonNullable<(typeof normalizedFilters)[number]> => Boolean(item)
   );
   const isCoordinateBufferMode = Boolean(
-    dsl.intent === "buffer_search" &&
-      dsl.spatialFilter?.type === "buffer" &&
-      dsl.spatialFilter?.center &&
+    nearestSafeDsl.intent === "buffer_search" &&
+      nearestSafeDsl.spatialFilter?.type === "buffer" &&
+      nearestSafeDsl.spatialFilter?.center &&
       hasCoordinateHint(question)
   );
   const coordinateSafeFilters = isCoordinateBufferMode
     ? filtered.filter((item) => !/^(x|y)$/i.test(item.field))
     : filtered;
   const withFilters = {
-    ...dsl,
+    ...nearestSafeDsl,
     attributeFilter: coordinateSafeFilters
   };
 
@@ -349,7 +386,9 @@ function normalizeFilterValues(
       withCountCleanup.spatialFilter?.sourceLayer &&
       withCountCleanup.spatialFilter?.sourceAttributeFilter?.length
   );
+  const isNearestMode = withCountCleanup.intent === "nearest";
   const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode
+    || isNearestMode
     ? withCountCleanup
     : applyOperatorHint(question, withCountCleanup, layer);
 
