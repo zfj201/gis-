@@ -25,6 +25,12 @@ interface ChatResponse {
     fetched?: number;
     requestedLimit?: number;
   };
+  semanticMeta?: {
+    retrievalHits?: number;
+    modelAttempts?: number;
+    repaired?: boolean;
+    decisionPath?: string;
+  } | null;
 }
 
 interface QueryPlanLike {
@@ -100,6 +106,12 @@ interface ChatMessage {
     radiusUsedMeters: number;
     candidateCount: number;
     sourceMode: string;
+  } | null;
+  semanticMeta?: {
+    retrievalHits: number;
+    modelAttempts: number;
+    repaired: boolean;
+    decisionPath: string;
   } | null;
 }
 
@@ -731,7 +743,15 @@ async function runQuery(): Promise<void> {
             requestedLimit: Number(parsed.executionMeta.requestedLimit ?? 0)
           }
         : undefined,
-      nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null)
+      nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null),
+      semanticMeta: parsed.semanticMeta
+        ? {
+            retrievalHits: Number(parsed.semanticMeta.retrievalHits ?? 0),
+            modelAttempts: Number(parsed.semanticMeta.modelAttempts ?? 0),
+            repaired: Boolean(parsed.semanticMeta.repaired),
+            decisionPath: String(parsed.semanticMeta.decisionPath ?? "")
+          }
+        : null
     });
   } catch (error) {
     pushMessage({
@@ -815,6 +835,11 @@ onBeforeUnmount(() => {
             </details>
             <div v-if="message.role === 'assistant' && message.normalizedByRule" class="msg-meta">
               语义对齐：已应用规则归一化
+            </div>
+            <div v-if="message.role === 'assistant' && message.semanticMeta" class="msg-meta">
+              链路：{{ message.semanticMeta.decisionPath || "unknown" }} · 检索样例
+              {{ message.semanticMeta.retrievalHits }} · 模型尝试 {{ message.semanticMeta.modelAttempts }}
+              <span v-if="message.semanticMeta.repaired">· 已修复</span>
             </div>
             <details
               v-if="message.role === 'assistant' && message.semanticWarnings && message.semanticWarnings.length > 0"

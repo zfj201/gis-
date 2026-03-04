@@ -24,6 +24,8 @@ import {
   evaluateSpatialIntentGate,
   type SpatialGateDecision
 } from "./spatial-intent-gate.js";
+import { buildSemanticPromptContext } from "./semantic-context-builder.js";
+import { appendSemanticFailureRecord } from "./semantic-retrieval.js";
 
 interface LlmSemanticOutput {
   actionable: boolean;
@@ -71,6 +73,14 @@ type SemanticOutputIssueKind = "schema" | "non_json" | "consistency";
 interface SemanticCompletionResult {
   content: string;
   usedResponseFormat: boolean;
+  attemptsUsed: number;
+}
+
+interface SemanticMetaPayload {
+  retrievalHits: number;
+  modelAttempts: number;
+  repaired: boolean;
+  decisionPath: string;
 }
 
 class SemanticOutputError extends Error {
@@ -930,6 +940,24 @@ function withParserSource(parsed: ParseResponse, parserSource: ParserSource): Pa
   };
 }
 
+function withSemanticMeta(parsed: ParseResponse, meta: Partial<SemanticMetaPayload>): ParseResponse {
+  const prev = parsed.semanticMeta ?? {
+    retrievalHits: 0,
+    modelAttempts: 0,
+    repaired: false,
+    decisionPath: "unknown"
+  };
+  return {
+    ...parsed,
+    semanticMeta: {
+      retrievalHits: typeof meta.retrievalHits === "number" ? meta.retrievalHits : prev.retrievalHits,
+      modelAttempts: typeof meta.modelAttempts === "number" ? meta.modelAttempts : prev.modelAttempts,
+      repaired: typeof meta.repaired === "boolean" ? meta.repaired : prev.repaired,
+      decisionPath: meta.decisionPath ?? prev.decisionPath
+    }
+  };
+}
+
 function providerToSource(provider: string): ParserSource {
   if (provider === "gemini" || provider === "groq" || provider === "openrouter") {
     return provider;
@@ -1051,7 +1079,8 @@ async function requestSemanticCompletion(
 
       return {
         content,
-        usedResponseFormat: useResponseFormat
+        usedResponseFormat: useResponseFormat,
+        attemptsUsed: attempt
       };
     } catch (error) {
       lastError = error;
@@ -1108,8 +1137,14 @@ function parseSemanticOutputToDsl(
     throw new SemanticOutputError("schema", `模型输出 Schema 校验失败：${(error as Error).message}`, rawJson);
   }
 
-  if (!isModelResultConsistent(question, parsed)) {
+  if (!isModelResultConsistent(question, parsed) && config.semanticConsistencyStrict) {
     throw new SemanticOutputError("consistency", "模型输出与语义一致性规则冲突。", rawJson);
+  }
+  if (!isModelResultConsistent(question, parsed) && !config.semanticConsistencyStrict) {
+    parsed = {
+      ...parsed,
+      semanticWarnings: [...(parsed.semanticWarnings ?? []), "模型输出与语义一致性规则存在偏差，已按宽松模式继续执行。"]
+    };
   }
   return parsed;
 }
@@ -1126,48 +1161,84 @@ async function parseWithOpenAICompatible(
   const catalog = layerRegistry.listCatalog();
   const queryableLayers = catalog.layers.filter((layer) => layer.queryable);
   const defaultLayerKey = layerRegistry.getDefaultLayer()?.layerKey ?? "fuzhou_parks";
-  const semanticSystemPrompt = buildSemanticSystemPrompt(queryableLayers);
-  const semanticFewShots = buildSemanticFewShots(defaultLayerKey, queryableLayers);
+  const context = await buildSemanticPromptContext({
+    question,
+    layers: queryableLayers,
+    defaultLayerKey
+  });
+  const semanticSystemPrompt = [
+    buildSemanticSystemPrompt(queryableLayers),
+    context.retrievalSystemHint
+  ]
+    .filter((item) => item && item.trim().length > 0)
+    .join("\n\n");
+  const baseFewShots = buildSemanticFewShots(defaultLayerKey, queryableLayers);
+  const semanticFewShots = [...context.retrievalFewShots, ...baseFewShots].slice(0, 24);
   const baseMessages = buildSemanticMessages(semanticSystemPrompt, semanticFewShots, question);
   const deadlineAt = options?.deadlineAt ?? Date.now() + 55_000;
+  const maxRepairRetry = Math.max(0, config.semanticModelRepairMaxRetry);
+  let modelAttempts = 0;
+  let repaired = false;
   const first = await requestSemanticCompletion(provider, baseMessages, true, deadlineAt);
+  modelAttempts += first.attemptsUsed;
 
   try {
-    return parseSemanticOutputToDsl(question, provider.parserSource, first.content);
+    const parsed = parseSemanticOutputToDsl(question, provider.parserSource, first.content);
+    return withSemanticMeta(parsed, {
+      retrievalHits: context.retrievalHits,
+      modelAttempts,
+      repaired,
+      decisionPath: provider.parserSource
+    });
   } catch (error) {
     if (!isRepairableSemanticError(error)) {
       throw error;
     }
 
-    const repairPrompt = buildSemanticRepairPrompt(question, error);
-    const repairMessages: OpenAIMessage[] = [
-      ...baseMessages,
-      {
-        role: "assistant",
-        content: first.content.slice(0, 2000)
-      },
-      {
-        role: "user",
-        content: repairPrompt
-      }
-    ];
-    const second = await requestSemanticCompletion(
-      provider,
-      repairMessages,
-      first.usedResponseFormat,
-      deadlineAt
-    );
-
-    try {
-      return parseSemanticOutputToDsl(question, provider.parserSource, second.content);
-    } catch (secondError) {
-      if (!isRepairableSemanticError(secondError)) {
-        throw secondError;
-      }
-      throw new Error(
-        `模型二次修复失败: first=${error.kind}; second=${secondError.kind}; ${secondError.message}`
+    let previousIssue: SemanticOutputError = error;
+    let previousContent = first.content;
+    for (let retry = 1; retry <= maxRepairRetry; retry += 1) {
+      repaired = true;
+      const repairPrompt = buildSemanticRepairPrompt(question, previousIssue);
+      const repairMessages: OpenAIMessage[] = [
+        ...baseMessages,
+        {
+          role: "assistant",
+          content: previousContent.slice(0, 2000)
+        },
+        {
+          role: "user",
+          content: repairPrompt
+        }
+      ];
+      const repairedCompletion = await requestSemanticCompletion(
+        provider,
+        repairMessages,
+        first.usedResponseFormat,
+        deadlineAt
       );
+      modelAttempts += repairedCompletion.attemptsUsed;
+      previousContent = repairedCompletion.content;
+
+      try {
+        const parsed = parseSemanticOutputToDsl(question, provider.parserSource, repairedCompletion.content);
+        return withSemanticMeta(parsed, {
+          retrievalHits: context.retrievalHits,
+          modelAttempts,
+          repaired,
+          decisionPath: `${provider.parserSource}:repair`
+        });
+      } catch (repairError) {
+        if (!isRepairableSemanticError(repairError)) {
+          throw repairError;
+        }
+        previousIssue = repairError;
+      }
     }
+
+    throw new Error(
+      `模型修复失败: first=${error.kind}; last=${previousIssue.kind}; ${previousIssue.message}`
+    );
   }
 }
 
@@ -1193,7 +1264,7 @@ async function parseWithOpenRouterCandidates(question: string): Promise<ParseRes
       break;
     }
     try {
-      return await parseWithOpenAICompatible(question, {
+      const parsed = await parseWithOpenAICompatible(question, {
         providerName: "openrouter",
         parserSource: "openrouter",
         apiKey: config.openrouterApiKey,
@@ -1207,6 +1278,9 @@ async function parseWithOpenRouterCandidates(question: string): Promise<ParseRes
         }
       }, {
         deadlineAt
+      });
+      return withSemanticMeta(parsed, {
+        decisionPath: `${parsed.semanticMeta?.decisionPath ?? "openrouter"}:${model}`
       });
     } catch (error) {
       lastError = error;
@@ -1235,7 +1309,7 @@ async function parseWithOpenRouterCandidates(question: string): Promise<ParseRes
 
 async function parseWithGeminiThenOpenRouter(question: string): Promise<ParseResponse> {
   try {
-    return await parseWithOpenAICompatible(question, {
+    const geminiParsed = await parseWithOpenAICompatible(question, {
       providerName: "gemini",
       parserSource: "gemini",
       apiKey: config.geminiApiKey,
@@ -1243,6 +1317,9 @@ async function parseWithGeminiThenOpenRouter(question: string): Promise<ParseRes
       model: config.geminiModel,
       timeoutMs: config.geminiTimeoutMs,
       maxAttempts: 3
+    });
+    return withSemanticMeta(geminiParsed, {
+      decisionPath: geminiParsed.semanticMeta?.decisionPath ?? "gemini"
     });
   } catch (geminiError) {
     const geminiReason = classifyModelFailureReason(geminiError);
@@ -1255,7 +1332,10 @@ async function parseWithGeminiThenOpenRouter(question: string): Promise<ParseRes
     });
 
     try {
-      return await parseWithOpenRouterCandidates(question);
+      const openrouterParsed = await parseWithOpenRouterCandidates(question);
+      return withSemanticMeta(openrouterParsed, {
+        decisionPath: `gemini->${openrouterParsed.semanticMeta?.decisionPath ?? "openrouter"}`
+      });
     } catch (openrouterError) {
       const openrouterReason = classifyModelFailureReason(openrouterError);
       const openrouterDetail = buildModelFailureDetail(openrouterError);
@@ -1344,18 +1424,31 @@ export async function parseQuestionSmart(
       isFallback: false
     });
     if (!gateDecision.isSpatial) {
-      return createNonSpatialParseResponse();
+      return withSemanticMeta(createNonSpatialParseResponse(), {
+        retrievalHits: 0,
+        modelAttempts: 0,
+        repaired: false,
+        decisionPath: "gate_non_spatial"
+      });
     }
   }
 
   const provider = config.llmProvider.trim().toLowerCase();
   if (provider === "rule") {
-    return withParserSource(parseQuestionByRules(question), "rule");
+    return withSemanticMeta(withParserSource(parseQuestionByRules(question), "rule"), {
+      retrievalHits: 0,
+      modelAttempts: 0,
+      repaired: false,
+      decisionPath: "rule_direct"
+    });
   }
 
   if (provider === "gemini") {
     try {
-      return await parseWithGeminiThenOpenRouter(question);
+      const parsed = await parseWithGeminiThenOpenRouter(question);
+      return withSemanticMeta(parsed, {
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "gemini"
+      });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
       const detail = buildModelFailureDetail(error);
@@ -1367,8 +1460,21 @@ export async function parseQuestionSmart(
         isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      await appendSemanticFailureRecord({
+        question,
+        parserFailureReason: reason,
+        parserFailureDetail: detail,
+        parserSource: "rule_fallback",
+        providerChain: "gemini->openrouter",
+        dsl: fallback.dsl
+      });
       return {
-        ...fallback,
+        ...withSemanticMeta(fallback, {
+          retrievalHits: 0,
+          modelAttempts: 0,
+          repaired: false,
+          decisionPath: "gemini->openrouter->rule_fallback"
+        }),
         parserFailureReason: reason,
         parserFailureDetail: detail
       };
@@ -1377,7 +1483,7 @@ export async function parseQuestionSmart(
 
   if (provider === "groq") {
     try {
-      return await parseWithOpenAICompatible(question, {
+      const parsed = await parseWithOpenAICompatible(question, {
         providerName: "groq",
         parserSource: "groq",
         apiKey: config.groqApiKey,
@@ -1385,6 +1491,9 @@ export async function parseQuestionSmart(
         model: config.groqModel,
         timeoutMs: config.groqTimeoutMs,
         maxAttempts: 3
+      });
+      return withSemanticMeta(parsed, {
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "groq"
       });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
@@ -1397,8 +1506,21 @@ export async function parseQuestionSmart(
         isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      await appendSemanticFailureRecord({
+        question,
+        parserFailureReason: reason,
+        parserFailureDetail: detail,
+        parserSource: "rule_fallback",
+        providerChain: "groq",
+        dsl: fallback.dsl
+      });
       return {
-        ...fallback,
+        ...withSemanticMeta(fallback, {
+          retrievalHits: 0,
+          modelAttempts: 0,
+          repaired: false,
+          decisionPath: "groq->rule_fallback"
+        }),
         parserFailureReason: reason,
         parserFailureDetail: detail
       };
@@ -1407,7 +1529,10 @@ export async function parseQuestionSmart(
 
   if (provider === "openrouter") {
     try {
-      return await parseWithOpenRouterCandidates(question);
+      const parsed = await parseWithOpenRouterCandidates(question);
+      return withSemanticMeta(parsed, {
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "openrouter"
+      });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
       const detail = buildModelFailureDetail(error);
@@ -1419,8 +1544,21 @@ export async function parseQuestionSmart(
         isFallback: true
       });
       const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      await appendSemanticFailureRecord({
+        question,
+        parserFailureReason: reason,
+        parserFailureDetail: detail,
+        parserSource: "rule_fallback",
+        providerChain: "openrouter",
+        dsl: fallback.dsl
+      });
       return {
-        ...fallback,
+        ...withSemanticMeta(fallback, {
+          retrievalHits: 0,
+          modelAttempts: 0,
+          repaired: false,
+          decisionPath: "openrouter->rule_fallback"
+        }),
         parserFailureReason: reason,
         parserFailureDetail: detail
       };
@@ -1428,7 +1566,12 @@ export async function parseQuestionSmart(
   }
 
   console.warn(`[semantic] 未识别的 LLM_PROVIDER=${provider}，已回退规则解析`);
-  return withParserSource(parseQuestionByRules(question), "rule");
+  return withSemanticMeta(withParserSource(parseQuestionByRules(question), "rule"), {
+    retrievalHits: 0,
+    modelAttempts: 0,
+    repaired: false,
+    decisionPath: "unknown_provider->rule"
+  });
 }
 
 export async function answerGeneralQuestion(question: string): Promise<GeneralChatResponse> {

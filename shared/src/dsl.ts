@@ -133,6 +133,12 @@ export interface ParseResponse {
   parserFailureDetail?: string;
   normalizedByRule?: boolean;
   semanticWarnings?: string[];
+  semanticMeta?: {
+    retrievalHits: number;
+    modelAttempts: number;
+    repaired: boolean;
+    decisionPath: string;
+  };
 }
 
 export interface QueryPlan {
@@ -179,4 +185,10 @@ export interface ExecuteResponse {
   parserFailureDetail?: string;
   normalizedByRule?: boolean;
   semanticWarnings?: string[];
+  semanticMeta?: {
+    retrievalHits: number;
+    modelAttempts: number;
+    repaired: boolean;
+    decisionPath: string;
+  };
 }

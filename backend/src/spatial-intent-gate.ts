@@ -33,6 +33,16 @@ const spatialActionSignals: Array<{ pattern: RegExp; score: number; reason: stri
     pattern: /(查询|检索|查找|统计|分组|汇总|多少|几个|数量|总数)/i,
     score: 1.2,
     reason: "空间查询动作词命中"
+  },
+  {
+    pattern: /(公园|道路|街巷|门牌|地址|宗地|院落|地块|房屋|建筑|单元楼|图层|要素)/i,
+    score: 2.8,
+    reason: "空间实体词命中"
+  },
+  {
+    pattern: /(鼓楼区|仓山区|台江区|晋安区|马尾区|长乐区|闽侯县|连江县|罗源县|闽清县|永泰县|福清市|平潭)/,
+    score: 1.6,
+    reason: "行政区实体命中"
   }
 ];
 
@@ -214,4 +224,3 @@ export function evaluateSpatialIntentGate(
     matchedSignals
   };
 }
-

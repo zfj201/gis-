@@ -101,17 +101,20 @@ Gemini 优先（失败回退 OpenRouter Free）接入步骤：
 - 支持手动添加多个 `FeatureServer`，自动发现子图层并可显示/隐藏。
 - 语义查询采用“自动图层路由 + 歧义追问”，当前版本一次仅执行单图层查询。
 - 图层配置会持久化到 `backend/data/layer-registry.json`。
+- 语义 RAG 语料位于 `backend/training/semantic-corpus.jsonl`，失败样本自动沉淀到 `backend/training/semantic-failures.jsonl`。
 
 ## 自动回归测试（100 条问句）
 
 用例文件：
 - `backend/testcases/chat-query-cases.json`
+- `backend/testcases/chat-query-cases-variant.json`（变体句式，可选）
 
 一键执行（会自动拉起 backend，并逐条写记录再生成报告）：
 
 ```bash
 npm run test:chat
 ```
+默认会同时执行基线 + 变体双数据集。
 
 默认输出目录：
 - 记录文件：`docs/test-reports/chat_regression_YYYYMMDD_HHmmss.records.jsonl`
@@ -120,12 +123,14 @@ npm run test:chat
 说明：
 - 每条问句执行后会立刻追加一行 JSON 记录（JSONL）。
 - 每条记录至少包含：`reply`、`targetLayer`、`parser`（含回退失败原因）、`dsl`、`queryPlan`、`fullResponse`。
+- 每条记录还包含：`semanticMeta`（`retrievalHits/modelAttempts/repaired/decisionPath`）。
 - 最终 Markdown 报告是从该记录文件聚合生成。
 
 可选参数（示例）：
 
 ```bash
 npm run test:chat -- --timeout-ms=60000 --base-url=http://127.0.0.1:3300
+npm run test:chat -- --max-cases=20
 ```
 
 仅根据已有记录文件重建报告：

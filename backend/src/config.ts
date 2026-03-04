@@ -43,6 +43,27 @@ export const config = {
   openrouterTimeoutMs: Number(process.env.OPENROUTER_TIMEOUT_MS ?? 12000),
   openrouterSiteUrl: process.env.OPENROUTER_SITE_URL ?? "",
   openrouterAppName: process.env.OPENROUTER_APP_NAME ?? "gis-semantic-query",
+  semanticRagEnabled: !["0", "false", "off"].includes(
+    String(process.env.SEMANTIC_RAG_ENABLED ?? "true").trim().toLowerCase()
+  ),
+  semanticRagTopK: Number(process.env.SEMANTIC_RAG_TOPK ?? 8),
+  semanticRagMaxExamples: Number(process.env.SEMANTIC_RAG_MAX_EXAMPLES ?? 6),
+  semanticModelRepairMaxRetry: Number(process.env.SEMANTIC_MODEL_REPAIR_MAX_RETRY ?? 2),
+  semanticConsistencyStrict: !["0", "false", "off"].includes(
+    String(process.env.SEMANTIC_CONSISTENCY_STRICT ?? "true").trim().toLowerCase()
+  ),
+  semanticCorpusPath: path.resolve(
+    workspaceRoot,
+    process.env.SEMANTIC_CORPUS_PATH ?? "backend/training/semantic-corpus.jsonl"
+  ),
+  semanticFailuresPath: path.resolve(
+    workspaceRoot,
+    process.env.SEMANTIC_FAILURES_PATH ?? "backend/training/semantic-failures.jsonl"
+  ),
+  semanticSynonymsPath: path.resolve(
+    workspaceRoot,
+    process.env.SEMANTIC_SYNONYMS_PATH ?? "backend/training/semantic-synonyms.json"
+  ),
   queryMaxFeatures: Number(process.env.QUERY_MAX_FEATURES ?? 500000),
   queryPageSize: Number(process.env.QUERY_PAGE_SIZE ?? 2000),
   queryMaxPages: Number(process.env.QUERY_MAX_PAGES ?? 2000),
