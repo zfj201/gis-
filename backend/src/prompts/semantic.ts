@@ -52,6 +52,8 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "【第3段：DSL 语义约束】",
     "dsl.intent 仅允许：search | count | group_stat | nearest | buffer_search。",
     "attributeFilter.operator 仅允许：= | like | > | >= | < | <=。",
+    "支持 filterExpr 逻辑表达式树：condition/group，group.logic 仅 and/or，children 至少1个。",
+    "当问句包含多个条件（且/并且/、/，/,/或/或者），优先输出 filterExpr；不要丢失 OR 语义。",
     `search/buffer_search 的 limit 必须 <= ${maxLimit}；若用户未明确“前N”，默认设为 ${maxLimit}。`,
     `nearest 的 limit 必须 <= ${nearestMax}；若用户未明确“前N”，默认设为 ${nearestDefault}。`,
     "buffer_search 需要 radius + unit(meter/kilometer)。",
@@ -70,13 +72,14 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "“包含/含有/相关/类似” => 模糊匹配 operator='like'，并使用 %value%。",
     "当句子包含“有哪些/列表/清单/名录”等问句尾词时，这些词不是检索关键词，必须从 value 中剔除。",
     "例如“名称包含生态的有哪些”应提取 value='生态'；“名称含有湿地的公园列表”应提取 value='湿地'。",
+    "连接词语义：且/并且/、/，/, => AND；或/或者 => OR；AND 优先于 OR。",
     "“附近/周边/X米内/X公里内” => intent=buffer_search。",
     "“最近/最近的/nearest” => intent=nearest。"
   ].join("\n");
 
   const section5 = [
     "【第5段：跨图层缓冲硬约束】",
-    "若问句是“某条线/某个面 X米内 的 另一图层”，必须填 spatialFilter.sourceLayer + spatialFilter.sourceAttributeFilter。",
+    "若问句是“某条线/某个面 X米内 的 另一图层”，必须填 spatialFilter.sourceLayer + sourceAttributeFilter 或 sourceFilterExpr。",
     "跨图层缓冲严禁伪造 spatialFilter.center。",
     "显式坐标（如 x:13303000,y:2996000）+ 附近语义时，才允许使用 spatialFilter.center，默认 wkid=3857。",
     "若为“源要素 最近 目标要素”，source 条件只能写在 spatialFilter.sourceAttributeFilter，不能写到目标 attributeFilter。"
@@ -153,6 +156,62 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           aggregation: { type: "count" },
           limit: maxLimit,
           output: { fields: [], returnGeometry: false }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "面积小于100的宗地院落且周长不超过300的宗地院落"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.95,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: parcelLayerKey,
+          attributeFilter: [],
+          filterExpr: {
+            kind: "group",
+            logic: "and",
+            children: [
+              { kind: "condition", field: "SHAPE__Area", operator: "<", value: "100" },
+              { kind: "condition", field: "SHAPE__Length", operator: "<=", value: "300" }
+            ]
+          },
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "筛选面积小于20或周长超过900的宗地院落"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.95,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: parcelLayerKey,
+          attributeFilter: [],
+          filterExpr: {
+            kind: "group",
+            logic: "or",
+            children: [
+              { kind: "condition", field: "SHAPE__Area", operator: "<", value: "20" },
+              { kind: "condition", field: "SHAPE__Length", operator: ">", value: "900" }
+            ]
+          },
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
         }
       })
     },

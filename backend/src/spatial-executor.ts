@@ -559,7 +559,7 @@ function isSourceBufferMode(dsl: SpatialQueryDSL): boolean {
   return Boolean(
     dsl.spatialFilter?.type === "buffer" &&
       dsl.spatialFilter.sourceLayer &&
-      dsl.spatialFilter.sourceAttributeFilter?.length
+      (dsl.spatialFilter.sourceFilterExpr || dsl.spatialFilter.sourceAttributeFilter?.length)
   );
 }
 
@@ -576,7 +576,8 @@ async function executeSourceBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutio
   }
 
   const sourceFilters = dsl.spatialFilter?.sourceAttributeFilter ?? [];
-  if (sourceFilters.length === 0) {
+  const sourceFilterExpr = dsl.spatialFilter?.sourceFilterExpr;
+  if (!sourceFilterExpr && sourceFilters.length === 0) {
     throw new UserFacingError(`请先指定源图层“${sourceLayer.name}”中的目标要素条件。`, {
       followUpQuestion: `请补充源要素条件，例如“标准名称为南二环的道路街巷100米内的门牌号码”。`
     });
@@ -586,6 +587,7 @@ async function executeSourceBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutio
     intent: "search",
     targetLayer: sourceLayer.layerKey,
     attributeFilter: sourceFilters,
+    filterExpr: sourceFilterExpr,
     aggregation: null,
     limit: config.queryMaxFeatures,
     output: {
@@ -729,7 +731,8 @@ async function resolveNearestSource(dsl: SpatialQueryDSL): Promise<NearestSource
   }
 
   const sourceFilters = dsl.spatialFilter?.sourceAttributeFilter ?? [];
-  if (!sourceFilters.length) {
+  const sourceFilterExpr = dsl.spatialFilter?.sourceFilterExpr;
+  if (!sourceFilterExpr && !sourceFilters.length) {
     const targetLayerName = layerRegistry.getLayer(dsl.targetLayer)?.name ?? "目标图层";
     throw new UserFacingError("最近邻查询缺少源要素条件。", {
       followUpQuestion: buildNearestSourceWhereFollowUp(sourceLayer.name, targetLayerName)
@@ -740,6 +743,7 @@ async function resolveNearestSource(dsl: SpatialQueryDSL): Promise<NearestSource
     intent: "search",
     targetLayer: sourceLayer.layerKey,
     attributeFilter: sourceFilters,
+    filterExpr: sourceFilterExpr,
     aggregation: null,
     limit: 2,
     output: {

@@ -17,6 +17,7 @@ interface ChatResponse {
   parserFailureReason?: string | null;
   parserFailureDetail?: string | null;
   normalizedByRule?: boolean;
+  semanticWarnings?: string[] | null;
   targetLayerName?: string;
   executionMeta?: {
     truncated?: boolean;
@@ -86,6 +87,7 @@ interface ChatMessage {
   parserFailureReason?: string | null;
   parserFailureDetail?: string | null;
   normalizedByRule?: boolean;
+  semanticWarnings?: string[] | null;
   targetLayerName?: string;
   executionMeta?: {
     truncated: boolean;
@@ -719,6 +721,7 @@ async function runQuery(): Promise<void> {
       parserFailureReason: parsed.parserFailureReason ?? null,
       parserFailureDetail: parsed.parserFailureDetail ?? null,
       normalizedByRule: parsed.normalizedByRule ?? false,
+      semanticWarnings: parsed.semanticWarnings ?? null,
       targetLayerName,
       executionMeta: parsed.executionMeta
         ? {
@@ -813,6 +816,13 @@ onBeforeUnmount(() => {
             <div v-if="message.role === 'assistant' && message.normalizedByRule" class="msg-meta">
               语义对齐：已应用规则归一化
             </div>
+            <details
+              v-if="message.role === 'assistant' && message.semanticWarnings && message.semanticWarnings.length > 0"
+              class="msg-details"
+            >
+              <summary>解析告警</summary>
+              <pre>{{ message.semanticWarnings.join("\n") }}</pre>
+            </details>
 
             <details v-if="message.dsl" class="msg-details">
               <summary>结构化 DSL</summary>

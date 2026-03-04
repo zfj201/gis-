@@ -464,7 +464,8 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       parserSource: general.parserSource,
       parserFailureReason: null,
       parserFailureDetail: null,
-      normalizedByRule: false
+      normalizedByRule: false,
+      semanticWarnings: null
     };
   }
 
@@ -480,7 +481,8 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       parserSource: parsed.parserSource,
       parserFailureReason: parsed.parserFailureReason ?? null,
       parserFailureDetail: parsed.parserFailureDetail ?? null,
-      normalizedByRule: parsed.normalizedByRule ?? false
+      normalizedByRule: parsed.normalizedByRule ?? false,
+      semanticWarnings: parsed.semanticWarnings ?? null
     };
   }
 
@@ -517,6 +519,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       parserFailureReason: parsed.parserFailureReason ?? null,
       parserFailureDetail: parsed.parserFailureDetail ?? null,
       normalizedByRule: parsed.normalizedByRule ?? false,
+      semanticWarnings: parsed.semanticWarnings ?? null,
       targetLayerName: layerName
     };
   } catch (error) {
@@ -531,7 +534,8 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
         parserSource: parsed.parserSource,
         parserFailureReason: parsed.parserFailureReason ?? null,
         parserFailureDetail: parsed.parserFailureDetail ?? null,
-        normalizedByRule: parsed.normalizedByRule ?? false
+        normalizedByRule: parsed.normalizedByRule ?? false,
+        semanticWarnings: parsed.semanticWarnings ?? null
       };
     }
     req.log.error(error);

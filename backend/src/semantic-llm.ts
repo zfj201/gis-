@@ -1,4 +1,5 @@
 import {
+  type FilterExprNode,
   type ParseResponse,
   type ParserSource,
   type SpatialQueryDSL,
@@ -121,12 +122,38 @@ function hasCountyDimensionText(question: string): boolean {
   );
 }
 
+function exprContainsCountyEquality(expr: FilterExprNode | undefined): boolean {
+  if (!expr) {
+    return false;
+  }
+  if (expr.kind === "condition") {
+    return (
+      expr.operator === "=" &&
+      /(区县|行政区划|县级政区|城市|所在乡镇|乡级政区)/.test(expr.field)
+    );
+  }
+  return expr.children.some((child) => exprContainsCountyEquality(child));
+}
+
 function hasCountyFilter(dsl: SpatialQueryDSL): boolean {
   return dsl.attributeFilter.some(
     (item) =>
       item.operator === "=" &&
       /(区县|行政区划|县级政区|城市|所在乡镇|乡级政区)/.test(item.field)
-  );
+  ) || exprContainsCountyEquality(dsl.filterExpr);
+}
+
+function exprContainsOr(expr: FilterExprNode | undefined): boolean {
+  if (!expr) {
+    return false;
+  }
+  if (expr.kind === "group") {
+    if (expr.logic === "or") {
+      return true;
+    }
+    return expr.children.some((child) => exprContainsOr(child));
+  }
+  return false;
 }
 
 function normalizeLimitByQuestion(question: string, dsl: SpatialQueryDSL): SpatialQueryDSL {
@@ -151,7 +178,7 @@ function normalizeLimitByQuestion(question: string, dsl: SpatialQueryDSL): Spati
 
 function isUnconstrainedSearch(dsl: SpatialQueryDSL): boolean {
   const noSpatial = !dsl.spatialFilter || !dsl.spatialFilter.type;
-  const noAttribute = !dsl.attributeFilter || dsl.attributeFilter.length === 0;
+  const noAttribute = (!dsl.attributeFilter || dsl.attributeFilter.length === 0) && !dsl.filterExpr;
   const noAggregation = !dsl.aggregation;
   const noSort = !dsl.sort;
   return dsl.intent === "search" && noSpatial && noAttribute && noAggregation && noSort;
@@ -348,6 +375,47 @@ function normalizeFilterList(
     );
 }
 
+function normalizeFilterExpr(raw: unknown): FilterExprNode | undefined {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const node = raw as Record<string, unknown>;
+  const kind = String(node.kind ?? "").trim().toLowerCase();
+  if (!kind) {
+    return undefined;
+  }
+  if (kind === "condition") {
+    const field = String(node.field ?? "").trim();
+    const value = String(node.value ?? "").trim();
+    if (!field || !value) {
+      return undefined;
+    }
+    return {
+      kind: "condition",
+      field,
+      operator: normalizeOperator(node.operator),
+      value
+    };
+  }
+  if (kind === "group") {
+    const logicRaw = String(node.logic ?? "").trim().toLowerCase();
+    const logic: "and" | "or" = logicRaw === "or" ? "or" : "and";
+    const childrenRaw = Array.isArray(node.children) ? node.children : [];
+    const children = childrenRaw
+      .map((child) => normalizeFilterExpr(child))
+      .filter((child): child is FilterExprNode => Boolean(child));
+    if (!children.length) {
+      return undefined;
+    }
+    return {
+      kind: "group",
+      logic,
+      children
+    };
+  }
+  return undefined;
+}
+
 function normalizeLimit(raw: unknown): number {
   const parsed = Number(raw);
   if (Number.isNaN(parsed) || parsed <= 0) {
@@ -370,6 +438,7 @@ function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
     intent: normalizeIntent(dsl.intent),
     targetLayer: String(dsl.targetLayer ?? ""),
     attributeFilter: normalizeFilterList(dsl.attributeFilter),
+    filterExpr: normalizeFilterExpr(dsl.filterExpr),
     aggregation:
       dsl.aggregation && typeof dsl.aggregation === "object"
         ? (dsl.aggregation as SpatialQueryDSL["aggregation"])
@@ -408,6 +477,7 @@ function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
       sourceLayer:
         spatialFilter.sourceLayer === undefined ? undefined : String(spatialFilter.sourceLayer),
       sourceAttributeFilter: normalizeFilterList(spatialFilter.sourceAttributeFilter),
+      sourceFilterExpr: normalizeFilterExpr(spatialFilter.sourceFilterExpr),
       center:
         spatialFilter.center && typeof spatialFilter.center === "object"
           ? (spatialFilter.center as any)
@@ -501,7 +571,7 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
       dsl.intent !== "buffer_search" ||
       dsl.spatialFilter?.type !== "buffer" ||
       !dsl.spatialFilter?.sourceLayer ||
-      !dsl.spatialFilter?.sourceAttributeFilter?.length
+      !(dsl.spatialFilter?.sourceFilterExpr || dsl.spatialFilter?.sourceAttributeFilter?.length)
     ) {
       return false;
     }
@@ -529,11 +599,20 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
   if (dsl.intent === "nearest") {
     const hasCenter = Boolean(dsl.spatialFilter?.center);
     const hasSource = Boolean(
-      dsl.spatialFilter?.sourceLayer && dsl.spatialFilter?.sourceAttributeFilter?.length
+      dsl.spatialFilter?.sourceLayer &&
+      (dsl.spatialFilter?.sourceFilterExpr || dsl.spatialFilter?.sourceAttributeFilter?.length)
     );
     if (!hasCenter && !hasSource) {
       return false;
     }
+  }
+
+  if (
+    /(或|或者)/.test(question) &&
+    !exprContainsOr(dsl.filterExpr) &&
+    !exprContainsOr(dsl.spatialFilter?.sourceFilterExpr)
+  ) {
+    return false;
   }
 
   if (hasCountyText(question) && !hasCountyFilter(dsl)) {

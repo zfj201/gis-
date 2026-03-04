@@ -1,4 +1,5 @@
 import {
+  type FilterExprNode,
   type LayerDescriptor,
   type ParseResponse,
   type SpatialQueryDSL,
@@ -229,7 +230,7 @@ function parseOperatorByToken(token: string): SpatialQueryDSL["attributeFilter"]
   if (/(小于等于|不超过|至多|<=)/i.test(value)) {
     return "<=";
   }
-  if (/(大于|高于|多于|以上|>)/i.test(value)) {
+  if (/(大于|高于|多于|以上|超过|>)/i.test(value)) {
     return ">";
   }
   if (/(小于|低于|少于|以下|<)/i.test(value)) {
@@ -258,7 +259,7 @@ function extractExplicitFieldCondition(
     const escaped = fieldToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const match = question.match(
       new RegExp(
-        `${escaped}\\s*(?:的)?\\s*(小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)\\s*[“"']?([^，。！？!?]+)`,
+        `${escaped}\\s*(?:的)?\\s*(小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)\\s*[“"']?([^，。！？!?]+)`,
         "i"
       )
     );
@@ -281,32 +282,243 @@ function extractExplicitFieldCondition(
   return null;
 }
 
-function extractSourceFilters(questionPart: string, sourceLayer: LayerDescriptor): SpatialQueryDSL["attributeFilter"] {
-  const fields = sourceLayer.fields.filter((field) => field.queryable).map((field) => field.name);
-  const explicit = extractExplicitFieldCondition(questionPart, fields);
-  if (explicit) {
-    return [
-      {
-        field: explicit.field,
-        operator: explicit.operator,
-        value: explicit.value
+type LogicConnector = "and" | "or";
+type FlatCondition = SpatialQueryDSL["attributeFilter"][number];
+
+interface ConditionExprParseResult {
+  expr: FilterExprNode | null;
+  flatConditions: FlatCondition[];
+  warnings: string[];
+}
+
+function connectorToLogic(connector: string): LogicConnector {
+  if (/(或|或者)/.test(connector)) {
+    return "or";
+  }
+  return "and";
+}
+
+function hasConditionSignal(text: string): boolean {
+  return /(小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)/i.test(
+    text
+  );
+}
+
+function splitLogicalSegments(text: string): { segments: string[]; connectors: LogicConnector[] } {
+  const tokens = text
+    .split(/(并且|或者|且|或|、|，|,|和|并)/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const segments: string[] = [];
+  const connectors: LogicConnector[] = [];
+  let pendingConnector: LogicConnector | null = null;
+
+  for (const token of tokens) {
+    if (/^(并且|或者|且|或|、|，|,|和|并)$/.test(token)) {
+      pendingConnector = connectorToLogic(token);
+      continue;
+    }
+
+    if (segments.length > 0) {
+      connectors.push(pendingConnector ?? "and");
+    }
+    pendingConnector = null;
+    segments.push(token);
+  }
+
+  return {
+    segments,
+    connectors
+  };
+}
+
+function conditionToExpr(condition: FlatCondition): FilterExprNode {
+  return {
+    kind: "condition",
+    field: condition.field,
+    operator: condition.operator,
+    value: condition.value
+  };
+}
+
+function mergeExprByLogic(logic: LogicConnector, left: FilterExprNode, right: FilterExprNode): FilterExprNode {
+  const mergedChildren: FilterExprNode[] = [];
+  const pushNode = (node: FilterExprNode): void => {
+    if (node.kind === "group" && node.logic === logic) {
+      mergedChildren.push(...node.children);
+      return;
+    }
+    mergedChildren.push(node);
+  };
+  pushNode(left);
+  pushNode(right);
+  if (mergedChildren.length === 1) {
+    return mergedChildren[0];
+  }
+  return {
+    kind: "group",
+    logic,
+    children: mergedChildren
+  };
+}
+
+function buildExprWithAndPriority(nodes: FilterExprNode[], connectors: LogicConnector[]): FilterExprNode {
+  if (nodes.length === 1) {
+    return nodes[0];
+  }
+
+  const normalizedConnectors: LogicConnector[] = [];
+  for (let i = 0; i < nodes.length - 1; i += 1) {
+    normalizedConnectors.push(connectors[i] ?? "and");
+  }
+
+  const orParts: FilterExprNode[] = [];
+  let current = nodes[0];
+  for (let i = 0; i < normalizedConnectors.length; i += 1) {
+    const connector = normalizedConnectors[i];
+    const next = nodes[i + 1];
+    if (connector === "and") {
+      current = mergeExprByLogic("and", current, next);
+    } else {
+      orParts.push(current);
+      current = next;
+    }
+  }
+  orParts.push(current);
+
+  if (orParts.length === 1) {
+    return orParts[0];
+  }
+  return {
+    kind: "group",
+    logic: "or",
+    children: orParts
+  };
+}
+
+function parseConditionExprByFields(questionText: string, fields: string[]): ConditionExprParseResult {
+  const { segments, connectors } = splitLogicalSegments(questionText);
+  const parsedConditions: FlatCondition[] = [];
+  const parsedNodes: FilterExprNode[] = [];
+  const parsedConnectors: LogicConnector[] = [];
+  const warnings: string[] = [];
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const condition = extractExplicitFieldCondition(segment, fields);
+    if (!condition) {
+      if (hasConditionSignal(segment)) {
+        warnings.push(`未识别条件片段：${segment}`);
       }
-    ];
+      continue;
+    }
+    const filter: FlatCondition = {
+      field: condition.field,
+      operator: condition.operator,
+      value: condition.value
+    };
+    if (parsedNodes.length > 0) {
+      parsedConnectors.push(connectors[index - 1] ?? "and");
+    }
+    parsedConditions.push(filter);
+    parsedNodes.push(conditionToExpr(filter));
+  }
+
+  if (parsedNodes.length === 0) {
+    return {
+      expr: null,
+      flatConditions: [],
+      warnings
+    };
+  }
+
+  return {
+    expr: buildExprWithAndPriority(parsedNodes, parsedConnectors),
+    flatConditions: parsedConditions,
+    warnings
+  };
+}
+
+function appendConditionToExpr(
+  currentExpr: FilterExprNode | undefined,
+  condition: FlatCondition
+): FilterExprNode {
+  const conditionExpr = conditionToExpr(condition);
+  if (!currentExpr) {
+    return conditionExpr;
+  }
+  return mergeExprByLogic("and", currentExpr, conditionExpr);
+}
+
+function extractSourceFilters(questionPart: string, sourceLayer: LayerDescriptor): {
+  sourceAttributeFilter: SpatialQueryDSL["attributeFilter"];
+  sourceFilterExpr?: FilterExprNode;
+  warnings: string[];
+} {
+  const fields = sourceLayer.fields.filter((field) => field.queryable).map((field) => field.name);
+  const parsed = parseConditionExprByFields(questionPart, fields);
+  if (parsed.expr) {
+    return {
+      sourceAttributeFilter: parsed.flatConditions,
+      sourceFilterExpr: parsed.expr,
+      warnings: parsed.warnings
+    };
   }
 
   const quoteMatch = questionPart.match(/[“"]([^"”]+)[”"]/);
   const nameField = findNameField(sourceLayer);
   if (quoteMatch?.[1] && nameField) {
-    return [
-      {
-        field: nameField,
-        operator: "=",
-        value: quoteMatch[1].trim()
-      }
-    ];
+    const quoteFilter: FlatCondition = {
+      field: nameField,
+      operator: "=",
+      value: quoteMatch[1].trim()
+    };
+    return {
+      sourceAttributeFilter: [quoteFilter],
+      sourceFilterExpr: conditionToExpr(quoteFilter),
+      warnings: parsed.warnings
+    };
   }
 
-  return [];
+  return {
+    sourceAttributeFilter: [],
+    warnings: parsed.warnings
+  };
+}
+
+function mergeWarnings(...warningGroups: Array<string[] | undefined>): string[] | undefined {
+  const values = warningGroups
+    .flat()
+    .filter((item): item is string => Boolean(item && item.trim().length > 0));
+  if (values.length === 0) {
+    return undefined;
+  }
+  return Array.from(new Set(values));
+}
+
+function withWarnings(response: ParseResponse, warnings: string[] | undefined): ParseResponse {
+  if (!warnings || warnings.length === 0) {
+    return response;
+  }
+  return {
+    ...response,
+    semanticWarnings: warnings
+  };
+}
+
+function parseTargetFilterExpr(
+  questionText: string,
+  layer: LayerDescriptor
+): ConditionExprParseResult {
+  const fields = layer.fields.filter((field) => field.queryable).map((field) => field.name);
+  return parseConditionExprByFields(questionText, fields);
+}
+
+function ensureFilterCompatibility(
+  dsl: SpatialQueryDSL,
+  flatConditions: FlatCondition[]
+): void {
+  dsl.attributeFilter = flatConditions;
 }
 
 function parseCrossLayerBuffer(
@@ -438,8 +650,8 @@ export function parseQuestion(question: string): ParseResponse {
       };
     }
 
-    const sourceFilters = extractSourceFilters(nearestClause.sourcePart, sourceResolved.layer);
-    if (!sourceFilters.length) {
+    const sourceFilterResult = extractSourceFilters(nearestClause.sourcePart, sourceResolved.layer);
+    if (!sourceFilterResult.sourceAttributeFilter.length) {
       const noFilterDsl = spatialQueryDslSchema.parse({
         intent: "nearest",
         targetLayer: targetResolved.layer.layerKey,
@@ -456,12 +668,12 @@ export function parseQuestion(question: string): ParseResponse {
           sourceAttributeFilter: []
         }
       });
-      return {
+      return withWarnings({
         dsl: noFilterDsl,
         confidence: 0.68,
         followUpQuestion: `请明确源要素条件（当前源图层：${sourceResolved.layer.name}），例如“OBJECTID为45854的${sourceResolved.layer.name}最近的${targetResolved.layer.name}”。`,
         parserSource: "rule"
-      };
+      }, sourceFilterResult.warnings);
     }
 
     const nearestDsl = spatialQueryDslSchema.parse({
@@ -477,7 +689,8 @@ export function parseQuestion(question: string): ParseResponse {
       spatialFilter: {
         type: "nearest",
         sourceLayer: sourceResolved.layer.layerKey,
-        sourceAttributeFilter: sourceFilters
+        sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
+        sourceFilterExpr: sourceFilterResult.sourceFilterExpr
       },
       locationEntity: {
         rawText: nearestClause.sourcePart,
@@ -486,13 +699,13 @@ export function parseQuestion(question: string): ParseResponse {
       }
     });
     const normalizedResult = normalizeDslByQuestion(normalized, nearestDsl);
-    return {
+    return withWarnings({
       dsl: normalizedResult.dsl,
       confidence: 0.88,
       followUpQuestion: null,
       parserSource: "rule",
       normalizedByRule: normalizedResult.normalized
-    };
+    }, sourceFilterResult.warnings);
   }
   if (/(最近|nearest)/i.test(normalized)) {
     const targetResolved = resolveTargetLayer(normalized);
@@ -556,8 +769,8 @@ export function parseQuestion(question: string): ParseResponse {
       };
     }
 
-    const sourceFilters = extractSourceFilters(crossLayer.sourcePart, sourceResolved.layer);
-    if (!sourceFilters.length) {
+    const sourceFilterResult = extractSourceFilters(crossLayer.sourcePart, sourceResolved.layer);
+    if (!sourceFilterResult.sourceAttributeFilter.length) {
       const noFilterDsl = spatialQueryDslSchema.parse({
         intent: "buffer_search",
         targetLayer: targetResolved.layer.layerKey,
@@ -576,12 +789,12 @@ export function parseQuestion(question: string): ParseResponse {
           sourceAttributeFilter: []
         }
       });
-      return {
+      return withWarnings({
         dsl: noFilterDsl,
         confidence: 0.68,
         followUpQuestion: `请明确源要素条件（当前源图层：${sourceResolved.layer.name}），例如“标准名称为南二环的${sourceResolved.layer.name}${crossLayer.radiusMeters}米内的${targetResolved.layer.name}”。`,
         parserSource: "rule"
-      };
+      }, sourceFilterResult.warnings);
     }
 
     const crossDsl = spatialQueryDslSchema.parse({
@@ -599,7 +812,8 @@ export function parseQuestion(question: string): ParseResponse {
         radius: crossLayer.radiusMeters,
         unit: "meter",
         sourceLayer: sourceResolved.layer.layerKey,
-        sourceAttributeFilter: sourceFilters
+        sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
+        sourceFilterExpr: sourceFilterResult.sourceFilterExpr
       },
       locationEntity: {
         rawText: crossLayer.sourcePart,
@@ -615,13 +829,13 @@ export function parseQuestion(question: string): ParseResponse {
       }
     });
     const normalizedResult = normalizeDslByQuestion(normalized, crossDsl);
-    return {
+    return withWarnings({
       dsl: normalizedResult.dsl,
       confidence: 0.88,
       followUpQuestion: null,
       parserSource: "rule",
       normalizedByRule: normalizedResult.normalized
-    };
+    }, sourceFilterResult.warnings);
   }
 
   const target = resolveTargetLayer(normalized);
@@ -660,12 +874,9 @@ export function parseQuestion(question: string): ParseResponse {
   const keyword = parseKeyword(normalized);
   const countyField = findCountyField(fallbackLayer);
   const nameField = findNameField(fallbackLayer);
-  const explicitCondition = isCoordinateBufferQuery
-    ? null
-    : extractExplicitFieldCondition(
-        normalized,
-        fallbackLayer.fields.filter((field) => field.queryable).map((field) => field.name)
-      );
+  const targetFilterResult = isCoordinateBufferQuery
+    ? { expr: null, flatConditions: [], warnings: [] as string[] }
+    : parseTargetFilterExpr(normalized, fallbackLayer);
 
   const dsl: SpatialQueryDSL = createBaseDsl(
     fallbackLayer.layerKey,
@@ -676,27 +887,34 @@ export function parseQuestion(question: string): ParseResponse {
   dsl.limit = limit;
 
   let followUpQuestion: string | null = target.followUpQuestion;
+  const semanticWarnings: string[] = [];
 
   if (county && countyField) {
-    dsl.attributeFilter.push({
+    const countyCondition: FlatCondition = {
       field: countyField,
       operator: "=",
       value: county
-    });
+    };
+    dsl.filterExpr = appendConditionToExpr(dsl.filterExpr, countyCondition);
+    dsl.attributeFilter.push(countyCondition);
   }
 
-  if (explicitCondition) {
-    dsl.attributeFilter.push({
-      field: explicitCondition.field,
-      operator: explicitCondition.operator,
-      value: explicitCondition.value
-    });
+  if (targetFilterResult.expr) {
+    dsl.filterExpr = dsl.filterExpr
+      ? mergeExprByLogic("and", dsl.filterExpr, targetFilterResult.expr)
+      : targetFilterResult.expr;
+    ensureFilterCompatibility(dsl, [...dsl.attributeFilter, ...targetFilterResult.flatConditions]);
+    semanticWarnings.push(...targetFilterResult.warnings);
   } else if (keyword && nameField && intent !== "count" && intent !== "group_stat") {
-    dsl.attributeFilter.push({
+    const keywordCondition: FlatCondition = {
       field: nameField,
       operator: "like",
       value: `%${keyword}%`
-    });
+    };
+    dsl.attributeFilter.push(keywordCondition);
+    dsl.filterExpr = appendConditionToExpr(dsl.filterExpr, keywordCondition);
+  } else {
+    semanticWarnings.push(...targetFilterResult.warnings);
   }
 
   if (intent === "count") {
@@ -752,12 +970,13 @@ export function parseQuestion(question: string): ParseResponse {
 
   const parsed = spatialQueryDslSchema.parse(dsl);
   const normalizedResult = normalizeDslByQuestion(normalized, parsed);
+  const mergedWarnings = mergeWarnings(semanticWarnings, normalizedResult.dsl.filterExpr ? [] : undefined);
 
-  return {
+  return withWarnings({
     dsl: normalizedResult.dsl,
     confidence: followUpQuestion ? 0.65 : 0.9,
     followUpQuestion,
     parserSource: "rule",
     normalizedByRule: normalizedResult.normalized
-  };
+  }, mergedWarnings);
 }

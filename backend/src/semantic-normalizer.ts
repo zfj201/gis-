@@ -1,4 +1,4 @@
-import type { SpatialQueryDSL } from "@gis/shared";
+import type { FilterExprNode, SpatialQueryDSL } from "@gis/shared";
 import type { LayerDescriptor } from "@gis/shared";
 import { UserFacingError } from "./errors.js";
 import { layerRegistry } from "./layer-registry.js";
@@ -8,7 +8,7 @@ type FilterOperator = SpatialQueryDSL["attributeFilter"][number]["operator"];
 const exactOperatorPattern = /(为|等于|就是|是|:|：)/;
 const fuzzyOperatorPattern = /(包含|含有|相关|类似)/;
 const greaterThanEqualPattern = /(大于等于|不少于|至少)/;
-const greaterThanPattern = /(大于|高于|多于|以上)/;
+const greaterThanPattern = /(大于|高于|多于|以上|超过)/;
 const lessThanEqualPattern = /(小于等于|不超过|至多)/;
 const lessThanPattern = /(小于|低于|少于|以下)/;
 const questionTailPattern =
@@ -157,6 +157,7 @@ function extractFieldCondition(
     "高于",
     "多于",
     "以上",
+    "超过",
     "包含",
     "含有",
     "相关",
@@ -201,6 +202,168 @@ function extractFieldCondition(
   }
 
   return null;
+}
+
+type FlatFilter = SpatialQueryDSL["attributeFilter"][number];
+
+function conditionToExpr(filter: FlatFilter): FilterExprNode {
+  return {
+    kind: "condition",
+    field: filter.field,
+    operator: filter.operator,
+    value: filter.value
+  };
+}
+
+function attributeFiltersToExpr(filters: SpatialQueryDSL["attributeFilter"]): FilterExprNode | null {
+  if (filters.length === 0) {
+    return null;
+  }
+  const children = filters.map((filter) => conditionToExpr(filter));
+  if (children.length === 1) {
+    return children[0];
+  }
+  return {
+    kind: "group",
+    logic: "and",
+    children
+  };
+}
+
+function flattenExprToAndFilters(expr: FilterExprNode | undefined): SpatialQueryDSL["attributeFilter"] {
+  if (!expr) {
+    return [];
+  }
+  if (expr.kind === "condition") {
+    return [{
+      field: expr.field,
+      operator: expr.operator,
+      value: expr.value
+    }];
+  }
+  if (expr.logic !== "and") {
+    return [];
+  }
+  const values: SpatialQueryDSL["attributeFilter"] = [];
+  for (const child of expr.children) {
+    if (child.kind !== "condition") {
+      return [];
+    }
+    values.push({
+      field: child.field,
+      operator: child.operator,
+      value: child.value
+    });
+  }
+  return values;
+}
+
+function normalizeExprNode(
+  expr: FilterExprNode,
+  layer: LayerDescriptor,
+  allowedFields: Set<string>,
+  options?: { dropXYFields?: boolean }
+): FilterExprNode | null {
+  if (expr.kind === "condition") {
+    const resolvedField = resolveFieldName(expr.field, layer) ?? expr.field;
+    if (!allowedFields.has(resolvedField)) {
+      throw new UserFacingError(`字段 ${expr.field} 不存在于目标图层 ${layer.name}。`, {
+        followUpQuestion: `字段 ${expr.field} 不存在于图层“${layer.name}”，请换一个字段名称后重试。`
+      });
+    }
+    if (options?.dropXYFields && /^(x|y)$/i.test(resolvedField)) {
+      return null;
+    }
+    const cleanedValue = cleanValue(expr.value);
+    if (!cleanedValue) {
+      return null;
+    }
+    if (expr.operator === "like") {
+      const normalizedLike = normalizeLikeValue(cleanedValue);
+      if (!normalizedLike) {
+        return null;
+      }
+      return {
+        ...expr,
+        field: resolvedField,
+        value: normalizedLike
+      };
+    }
+    return {
+      ...expr,
+      field: resolvedField,
+      value: cleanedValue
+    };
+  }
+
+  const children = expr.children
+    .map((child) => normalizeExprNode(child, layer, allowedFields, options))
+    .filter((item): item is FilterExprNode => Boolean(item));
+  if (children.length === 0) {
+    return null;
+  }
+  if (children.length === 1) {
+    return children[0];
+  }
+  return {
+    kind: "group",
+    logic: expr.logic,
+    children
+  };
+}
+
+function shouldDropCountTailCondition(
+  condition: Extract<FilterExprNode, { kind: "condition" }>,
+  normalizedQuestion: string,
+  nameLikeFields: Set<string>
+): boolean {
+  if (!nameLikeFields.has(condition.field)) {
+    return false;
+  }
+  const normalizedValue = condition.value.replace(/%/g, "").replace(/\s+/g, "");
+  if (!normalizedValue) {
+    return true;
+  }
+  if (/(有多少个|有几个|多少个|几个|数量|总数)/.test(normalizedValue)) {
+    return true;
+  }
+  if (normalizedQuestion.endsWith(normalizedValue) && /(有多少个|有几个|多少|几个)/.test(normalizedQuestion)) {
+    return true;
+  }
+  return false;
+}
+
+function removeWeakQuestionTailExpr(
+  expr: FilterExprNode | undefined,
+  question: string,
+  nameLikeFields: Set<string>
+): FilterExprNode | undefined {
+  if (!expr) {
+    return expr;
+  }
+  const normalizedQuestion = question.replace(/\s+/g, "");
+
+  const walk = (node: FilterExprNode): FilterExprNode | null => {
+    if (node.kind === "condition") {
+      if (shouldDropCountTailCondition(node, normalizedQuestion, nameLikeFields)) {
+        return null;
+      }
+      return node;
+    }
+    const children = node.children.map((child) => walk(child)).filter((item): item is FilterExprNode => Boolean(item));
+    if (children.length === 0) {
+      return null;
+    }
+    if (children.length === 1) {
+      return children[0];
+    }
+    return {
+      ...node,
+      children
+    };
+  };
+
+  return walk(expr) ?? undefined;
 }
 
 function removeWeakQuestionTailFilters(
@@ -290,6 +453,7 @@ function normalizeNearestFiltersByQuestion(
 
   return {
     ...dsl,
+    filterExpr: filters.length > 0 ? conditionToExpr(filters[0]) : undefined,
     attributeFilter: filters
   };
 }
@@ -331,70 +495,52 @@ function normalizeFilterValues(
       .map((field) => field.name)
   );
 
-  const normalizedFilters = nearestSafeDsl.attributeFilter.map((filter) => {
-    const resolvedField = resolveFieldName(filter.field, layer) ?? filter.field;
-    if (!allowedFields.has(resolvedField)) {
-      throw new UserFacingError(`字段 ${filter.field} 不存在于目标图层 ${layer.name}。`, {
-        followUpQuestion: `字段 ${filter.field} 不存在于图层“${layer.name}”，请换一个字段名称后重试。`
-      });
-    }
-
-    const cleanedValue = cleanValue(filter.value);
-    if (!cleanedValue) {
-      return null;
-    }
-
-    if (filter.operator === "like") {
-      const normalizedLike = normalizeLikeValue(cleanedValue);
-      if (!normalizedLike) {
-        return null;
-      }
-      return {
-        ...filter,
-        field: resolvedField,
-        value: normalizedLike
-      };
-    }
-
-    return {
-      ...filter,
-      field: resolvedField,
-      value: cleanedValue
-    };
-  });
-
-  const filtered = normalizedFilters.filter(
-    (item): item is NonNullable<(typeof normalizedFilters)[number]> => Boolean(item)
-  );
   const isCoordinateBufferMode = Boolean(
     nearestSafeDsl.intent === "buffer_search" &&
       nearestSafeDsl.spatialFilter?.type === "buffer" &&
       nearestSafeDsl.spatialFilter?.center &&
       hasCoordinateHint(question)
   );
-  const coordinateSafeFilters = isCoordinateBufferMode
-    ? filtered.filter((item) => !/^(x|y)$/i.test(item.field))
-    : filtered;
-  const withFilters = {
+  const effectiveExpr = nearestSafeDsl.filterExpr ?? attributeFiltersToExpr(nearestSafeDsl.attributeFilter);
+  const normalizedExpr = effectiveExpr
+    ? normalizeExprNode(effectiveExpr, layer, allowedFields, {
+        dropXYFields: isCoordinateBufferMode
+      }) ?? undefined
+    : undefined;
+
+  const withFilters: SpatialQueryDSL = {
     ...nearestSafeDsl,
-    attributeFilter: coordinateSafeFilters
+    filterExpr: normalizedExpr,
+    attributeFilter: flattenExprToAndFilters(normalizedExpr)
   };
 
-  const withCountCleanup = removeWeakQuestionTailFilters(withFilters, question, nameLikeFields);
+  const isCountLike =
+    withFilters.intent === "count" || withFilters.intent === "group_stat" || withFilters.aggregation?.type === "count";
+  const countCleanExpr = isCountLike
+    ? removeWeakQuestionTailExpr(withFilters.filterExpr, question, nameLikeFields)
+    : withFilters.filterExpr;
+  const withCountCleanup: SpatialQueryDSL = {
+    ...withFilters,
+    filterExpr: countCleanExpr,
+    attributeFilter: flattenExprToAndFilters(countCleanExpr)
+  };
   const isSourceBufferMode = Boolean(
     withCountCleanup.intent === "buffer_search" &&
       withCountCleanup.spatialFilter?.sourceLayer &&
-      withCountCleanup.spatialFilter?.sourceAttributeFilter?.length
+      (withCountCleanup.spatialFilter?.sourceFilterExpr || withCountCleanup.spatialFilter?.sourceAttributeFilter?.length)
   );
   const isNearestMode = withCountCleanup.intent === "nearest";
+  const hasFilterExpr = Boolean(withCountCleanup.filterExpr);
   const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode
     || isNearestMode
+    || hasFilterExpr
     ? withCountCleanup
     : applyOperatorHint(question, withCountCleanup, layer);
 
   const sourceLayerKey = withOperatorHint.spatialFilter?.sourceLayer;
-  const sourceFilters = withOperatorHint.spatialFilter?.sourceAttributeFilter ?? [];
-  if (!sourceLayerKey || sourceFilters.length === 0) {
+  const sourceExpr = withOperatorHint.spatialFilter?.sourceFilterExpr ??
+    attributeFiltersToExpr(withOperatorHint.spatialFilter?.sourceAttributeFilter ?? []);
+  if (!sourceLayerKey || !sourceExpr) {
     return withOperatorHint;
   }
 
@@ -404,41 +550,19 @@ function normalizeFilterValues(
   }
 
   const sourceAllowedFields = new Set(sourceLayer.fields.filter((field) => field.queryable).map((field) => field.name));
-  const normalizedSourceFilters = sourceFilters
-    .map((filter) => {
-      const resolvedField = resolveFieldName(filter.field, sourceLayer) ?? filter.field;
-      if (!sourceAllowedFields.has(resolvedField)) {
-        throw new UserFacingError(`源图层字段 ${filter.field} 不存在于 ${sourceLayer.name}。`, {
-          followUpQuestion: `字段 ${filter.field} 不存在于源图层“${sourceLayer.name}”，请换一个字段名称后重试。`
-        });
-      }
+  const normalizedSourceExpr = normalizeExprNode(sourceExpr, sourceLayer, sourceAllowedFields) ?? undefined;
+  const normalizedSourceFilters = flattenExprToAndFilters(normalizedSourceExpr);
 
-      const cleanedValue = cleanValue(filter.value);
-      if (!cleanedValue) {
-        return null;
-      }
-
-      if (filter.operator === "like") {
-        return {
-          ...filter,
-          field: resolvedField,
-          value: normalizeLikeValue(cleanedValue)
-        };
-      }
-
-      return {
-        ...filter,
-        field: resolvedField,
-        value: cleanedValue
-      };
-    })
-    .filter((item): item is NonNullable<(typeof sourceFilters)[number]> => Boolean(item));
+  const effectiveTargetExpr = withOperatorHint.filterExpr ?? attributeFiltersToExpr(withOperatorHint.attributeFilter) ?? undefined;
 
   return {
     ...withOperatorHint,
+    filterExpr: effectiveTargetExpr,
+    attributeFilter: flattenExprToAndFilters(effectiveTargetExpr),
     spatialFilter: withOperatorHint.spatialFilter
       ? {
           ...withOperatorHint.spatialFilter,
+          sourceFilterExpr: normalizedSourceExpr,
           sourceAttributeFilter: normalizedSourceFilters
         }
       : withOperatorHint.spatialFilter

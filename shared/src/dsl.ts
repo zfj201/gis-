@@ -31,6 +31,39 @@ export const attributeFilterSchema = z.object({
   value: z.string().min(1)
 });
 
+export type FilterConditionNode = {
+  kind: "condition";
+  field: string;
+  operator: z.infer<typeof operatorSchema>;
+  value: string;
+};
+
+export type FilterGroupNode = {
+  kind: "group";
+  logic: "and" | "or";
+  children: FilterExprNode[];
+};
+
+export type FilterExprNode = FilterConditionNode | FilterGroupNode;
+
+export const filterConditionNodeSchema = z.object({
+  kind: z.literal("condition"),
+  field: z.string().min(1),
+  operator: operatorSchema,
+  value: z.string().min(1)
+});
+
+export const filterExprNodeSchema: z.ZodType<FilterExprNode> = z.lazy(() =>
+  z.union([
+    filterConditionNodeSchema,
+    z.object({
+      kind: z.literal("group"),
+      logic: z.enum(["and", "or"]),
+      children: z.array(filterExprNodeSchema).min(1)
+    })
+  ])
+);
+
 export const spatialFilterSchema = z
   .object({
     type: z.enum(["buffer", "intersects", "nearest"]).optional(),
@@ -39,6 +72,7 @@ export const spatialFilterSchema = z
     ringOnly: z.boolean().optional(),
     sourceLayer: z.string().min(1).optional(),
     sourceAttributeFilter: z.array(attributeFilterSchema).optional(),
+    sourceFilterExpr: filterExprNodeSchema.optional(),
     center: z
       .object({
         x: z.number(),
@@ -66,6 +100,7 @@ export const spatialQueryDslSchema = z.object({
     .optional(),
   spatialFilter: spatialFilterSchema,
   attributeFilter: z.array(attributeFilterSchema).default([]),
+  filterExpr: filterExprNodeSchema.optional(),
   aggregation: z
     .object({
       type: z.enum(["count", "group_count"]).optional(),
@@ -97,6 +132,7 @@ export interface ParseResponse {
   parserFailureReason?: string;
   parserFailureDetail?: string;
   normalizedByRule?: boolean;
+  semanticWarnings?: string[];
 }
 
 export interface QueryPlan {
@@ -142,4 +178,5 @@ export interface ExecuteResponse {
   parserFailureReason?: string;
   parserFailureDetail?: string;
   normalizedByRule?: boolean;
+  semanticWarnings?: string[];
 }
