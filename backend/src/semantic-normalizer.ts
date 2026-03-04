@@ -11,21 +11,26 @@ const greaterThanEqualPattern = /(大于等于|不少于|至少)/;
 const greaterThanPattern = /(大于|高于|多于|以上)/;
 const lessThanEqualPattern = /(小于等于|不超过|至多)/;
 const lessThanPattern = /(小于|低于|少于|以下)/;
-const questionTailPattern = /(有多少个|有几个|多少个|几个|数量|总数|是多少)$/;
+const questionTailPattern =
+  /(有多少个|有几个|多少个|几个|数量|总数|是多少|有哪些|有什么|都有哪些|都有什么|列表|清单|名录)$/;
 const punctuationEndPattern = /[。！？!?，,\s]+$/g;
 const valueNoiseSuffixPatterns = [
   /的道路街巷$/,
   /的门牌号码$/,
   /的公园$/,
+  /的公园列表$/,
+  /的公园清单$/,
+  /的公园名录$/,
   /的房屋建筑$/,
   /的单元楼$/,
   /的宗地院落$/,
-  /道路街巷$/,
-  /门牌号码$/,
-  /房屋建筑$/,
-  /单元楼$/,
-  /宗地院落$/,
-  /公园$/
+  /的有哪些$/,
+  /的有什么$/,
+  /有哪些$/,
+  /有什么$/,
+  /列表$/,
+  /清单$/,
+  /名录$/
 ];
 
 function escapeRegex(value: string): string {
@@ -44,9 +49,18 @@ function cleanValue(value: string): string {
     .replace(punctuationEndPattern, "")
     .trim();
   next = next.replace(/^的+/, "").trim();
-  for (const pattern of valueNoiseSuffixPatterns) {
-    next = next.replace(pattern, "").trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pattern of valueNoiseSuffixPatterns) {
+      const updated = next.replace(pattern, "").trim();
+      if (updated !== next) {
+        next = updated;
+        changed = true;
+      }
+    }
   }
+  next = next.replace(/[的]+$/g, "").trim();
   return next;
 }
 
@@ -237,6 +251,13 @@ function normalizeLikeValue(value: string): string {
   return `%${cleaned}%`;
 }
 
+function hasCoordinateHint(question: string): boolean {
+  return (
+    /-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?/.test(question) ||
+    /x\s*[:：]\s*-?\d+(?:\.\d+)?\s*[，,\s]+y\s*[:：]\s*-?\d+(?:\.\d+)?/i.test(question)
+  );
+}
+
 function applyOperatorHint(
   question: string,
   dsl: SpatialQueryDSL,
@@ -308,9 +329,18 @@ function normalizeFilterValues(
   const filtered = normalizedFilters.filter(
     (item): item is NonNullable<(typeof normalizedFilters)[number]> => Boolean(item)
   );
+  const isCoordinateBufferMode = Boolean(
+    dsl.intent === "buffer_search" &&
+      dsl.spatialFilter?.type === "buffer" &&
+      dsl.spatialFilter?.center &&
+      hasCoordinateHint(question)
+  );
+  const coordinateSafeFilters = isCoordinateBufferMode
+    ? filtered.filter((item) => !/^(x|y)$/i.test(item.field))
+    : filtered;
   const withFilters = {
     ...dsl,
-    attributeFilter: filtered
+    attributeFilter: coordinateSafeFilters
   };
 
   const withCountCleanup = removeWeakQuestionTailFilters(withFilters, question, nameLikeFields);
@@ -319,7 +349,7 @@ function normalizeFilterValues(
       withCountCleanup.spatialFilter?.sourceLayer &&
       withCountCleanup.spatialFilter?.sourceAttributeFilter?.length
   );
-  const withOperatorHint = isSourceBufferMode
+  const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode
     ? withCountCleanup
     : applyOperatorHint(question, withCountCleanup, layer);
 

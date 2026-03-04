@@ -27,12 +27,13 @@ interface LlmSemanticOutput {
 }
 
 interface OpenAICompatibleConfig {
-  providerName: "groq" | "openrouter";
-  parserSource: "groq" | "openrouter";
+  providerName: "gemini" | "groq" | "openrouter";
+  parserSource: "gemini" | "groq" | "openrouter";
   apiKey: string;
   baseUrl: string;
   model: string;
   timeoutMs: number;
+  maxAttempts?: number;
   extraHeaders?: Record<string, string>;
 }
 
@@ -90,8 +91,20 @@ function isCountIntentText(question: string): boolean {
   return /(多少|几个|总数|数量)/.test(question);
 }
 
+function isGroupStatIntentText(question: string): boolean {
+  return /(按|按照|以|基于).*(区县|行政区划|县级政区|乡镇|维度).*(统计|分组|汇总)|各(区县|行政区划|乡镇).*(数量|个数|分布|多少)|各区县分别有多少|(?:区县|行政区划).*(维度|分组|分布|汇总)/.test(
+    question
+  );
+}
+
 function hasCountyText(question: string): boolean {
   return /(鼓楼区|仓山区|台江区|晋安区|马尾区|长乐区|闽侯县|连江县|罗源县|闽清县|永泰县|福清市|平潭县)/.test(
+    question
+  );
+}
+
+function hasCountyDimensionText(question: string): boolean {
+  return /(区县|行政区划|县级政区|乡镇|街道).*(维度|分组|分布|汇总|统计)|按.*(区县|行政区划|县级政区|乡镇|街道)/.test(
     question
   );
 }
@@ -477,7 +490,17 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
     }
   }
 
-  if (isCountIntentText(question)) {
+  if (isGroupStatIntentText(question)) {
+    const isGroupIntent =
+      dsl.intent === "group_stat" ||
+      dsl.aggregation?.type === "group_count" ||
+      (Array.isArray(dsl.aggregation?.groupBy) && dsl.aggregation.groupBy.length > 0);
+    if (!isGroupIntent) {
+      return false;
+    }
+  }
+
+  if (isCountIntentText(question) && !isGroupStatIntentText(question)) {
     if (dsl.intent !== "count" && dsl.aggregation?.type !== "count") {
       return false;
     }
@@ -506,7 +529,7 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
 function normalizeModelOutput(
   question: string,
   output: LlmSemanticOutput,
-  parserSource: "groq" | "openrouter"
+  parserSource: "gemini" | "groq" | "openrouter"
 ): ParseResponse {
   if (!output.actionable) {
     return {
@@ -537,7 +560,46 @@ function normalizeModelOutput(
 
   const normalizedDsl = normalizeLimitByQuestion(question, parsedWithLegacy);
   const routed = applyLayerRouting(question, normalizedDsl);
-  const normalizedByRule = normalizeDslByQuestion(question, routed.dsl);
+  let alignedDsl = routed.dsl;
+  if (isGroupStatIntentText(question)) {
+    alignedDsl = {
+      ...alignedDsl,
+      intent: "group_stat",
+      aggregation:
+        alignedDsl.aggregation?.type === "group_count"
+          ? alignedDsl.aggregation
+          : {
+              type: "group_count",
+              groupBy: alignedDsl.aggregation?.groupBy ?? []
+            },
+      output: {
+        ...alignedDsl.output,
+        returnGeometry: false
+      }
+    };
+  }
+
+  if (isGroupStatIntentText(question) && hasCountyDimensionText(question)) {
+    const targetLayer = layerRegistry.getLayer(alignedDsl.targetLayer);
+    if (targetLayer) {
+      const countyField = findCountyField(targetLayer);
+      if (countyField) {
+        alignedDsl = {
+          ...alignedDsl,
+          aggregation: {
+            type: "group_count",
+            groupBy: [countyField]
+          },
+          sort: {
+            by: countyField,
+            order: "asc"
+          }
+        };
+      }
+    }
+  }
+
+  const normalizedByRule = normalizeDslByQuestion(question, alignedDsl);
   return {
     dsl: normalizedByRule.dsl,
     confidence: clampConfidence(output.confidence),
@@ -555,7 +617,7 @@ function withParserSource(parsed: ParseResponse, parserSource: ParserSource): Pa
 }
 
 function providerToSource(provider: string): ParserSource {
-  if (provider === "groq" || provider === "openrouter") {
+  if (provider === "gemini" || provider === "groq" || provider === "openrouter") {
     return provider;
   }
   return "rule";
@@ -566,6 +628,24 @@ function isResponseFormatUnsupported(statusCode: number, responseText: string): 
     return false;
   }
   return /(response_format|json_object|unsupported|not supported|invalid.*response_format)/i.test(responseText);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function calcRetryDelayMs(message: string, attempt: number): number {
+  const base = Math.min(12_000, 1_200 * 2 ** (attempt - 1));
+  if (/free-models-per-min|per-minute|retry-after/i.test(message)) {
+    return Math.max(base, 10_000);
+  }
+  if (/429|rate limit/i.test(message)) {
+    return Math.max(base, 6_000);
+  }
+  if (/402/i.test(message)) {
+    return Math.max(base, 4_000);
+  }
+  return base;
 }
 
 function isRepairableSemanticError(error: unknown): error is SemanticOutputError {
@@ -598,15 +678,21 @@ function buildSemanticMessages(
 async function requestSemanticCompletion(
   provider: OpenAICompatibleConfig,
   messages: OpenAIMessage[],
-  preferJsonFormat: boolean
+  preferJsonFormat: boolean,
+  deadlineAt: number
 ): Promise<SemanticCompletionResult> {
   let lastError: unknown = null;
   let useResponseFormat = preferJsonFormat;
-  const maxAttempts = 3;
+  const maxAttempts = Math.max(1, provider.maxAttempts ?? 4);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 1_500) {
+      throw new Error(`${provider.providerName} 请求超出总时限`);
+    }
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), provider.timeoutMs);
+    const attemptTimeoutMs = Math.max(1_000, Math.min(provider.timeoutMs, remainingMs - 250));
+    const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
     try {
       const requestBody: Record<string, unknown> = {
         model: provider.model,
@@ -656,17 +742,26 @@ async function requestSemanticCompletion(
     } catch (error) {
       lastError = error;
       const message = (error as Error)?.message ?? "";
-      const shouldRetry = attempt < maxAttempts && /aborted|timeout|429|5\d\d/i.test(message);
+      const shouldRetry = attempt < maxAttempts && /aborted|timeout|429|402|5\d\d|rate limit/i.test(message);
+      const retryDelayMs = shouldRetry ? calcRetryDelayMs(message, attempt) : 0;
       console.warn("[semantic] provider attempt failed", {
         provider: provider.providerName,
         attempt,
         maxAttempts,
+        attemptTimeoutMs,
+        remainingMs,
         shouldRetry,
+        retryDelayMs,
         reason: message
       });
       if (!shouldRetry) {
         throw error;
       }
+      const safeDelayMs = Math.max(0, Math.min(retryDelayMs, deadlineAt - Date.now() - 250));
+      if (safeDelayMs <= 0) {
+        throw error;
+      }
+      await sleep(safeDelayMs);
     } finally {
       clearTimeout(timeoutId);
     }
@@ -677,7 +772,7 @@ async function requestSemanticCompletion(
 
 function parseSemanticOutputToDsl(
   question: string,
-  parserSource: "groq" | "openrouter",
+  parserSource: "gemini" | "groq" | "openrouter",
   rawContent: string
 ): ParseResponse {
   const rawJson = extractJsonString(rawContent);
@@ -707,7 +802,8 @@ function parseSemanticOutputToDsl(
 
 async function parseWithOpenAICompatible(
   question: string,
-  provider: OpenAICompatibleConfig
+  provider: OpenAICompatibleConfig,
+  options?: { deadlineAt?: number }
 ): Promise<ParseResponse> {
   if (!provider.apiKey) {
     throw new Error(`${provider.providerName.toUpperCase()}_API_KEY 未配置`);
@@ -719,7 +815,8 @@ async function parseWithOpenAICompatible(
   const semanticSystemPrompt = buildSemanticSystemPrompt(queryableLayers);
   const semanticFewShots = buildSemanticFewShots(defaultLayerKey, queryableLayers);
   const baseMessages = buildSemanticMessages(semanticSystemPrompt, semanticFewShots, question);
-  const first = await requestSemanticCompletion(provider, baseMessages, true);
+  const deadlineAt = options?.deadlineAt ?? Date.now() + 55_000;
+  const first = await requestSemanticCompletion(provider, baseMessages, true, deadlineAt);
 
   try {
     return parseSemanticOutputToDsl(question, provider.parserSource, first.content);
@@ -743,7 +840,8 @@ async function parseWithOpenAICompatible(
     const second = await requestSemanticCompletion(
       provider,
       repairMessages,
-      first.usedResponseFormat
+      first.usedResponseFormat,
+      deadlineAt
     );
 
     try {
@@ -755,6 +853,102 @@ async function parseWithOpenAICompatible(
       throw new Error(
         `模型二次修复失败: first=${error.kind}; second=${secondError.kind}; ${secondError.message}`
       );
+    }
+  }
+}
+
+function buildModelCandidates(primary: string, fallbackModels: string[]): string[] {
+  const models = [primary, ...fallbackModels].map((item) => item.trim()).filter(Boolean);
+  const deduped = Array.from(new Set(models));
+  if (deduped.length > 1) {
+    deduped.push(deduped[0]);
+  }
+  return deduped;
+}
+
+async function parseWithOpenRouterCandidates(question: string): Promise<ParseResponse> {
+  const modelCandidates = buildModelCandidates(config.openrouterModel, config.openrouterFallbackModels);
+  const deadlineAt = Date.now() + Math.max(45_000, Math.min(90_000, config.openrouterTimeoutMs + 20_000));
+  let lastError: unknown = null;
+
+  for (let index = 0; index < modelCandidates.length; index += 1) {
+    const model = modelCandidates[index];
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 1_500) {
+      lastError = new Error("openrouter 总时限已耗尽");
+      break;
+    }
+    try {
+      return await parseWithOpenAICompatible(question, {
+        providerName: "openrouter",
+        parserSource: "openrouter",
+        apiKey: config.openrouterApiKey,
+        baseUrl: config.openrouterBaseUrl,
+        model,
+        timeoutMs: Math.max(3_000, Math.min(config.openrouterTimeoutMs, remainingMs - 250)),
+        maxAttempts: 2,
+        extraHeaders: {
+          ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+          "X-Title": config.openrouterAppName
+        }
+      }, {
+        deadlineAt
+      });
+    } catch (error) {
+      lastError = error;
+      const reason = classifyModelFailureReason(error);
+      const isRetryable =
+        reason === "provider_http_error" ||
+        reason === "provider_timeout" ||
+        reason === "provider_unknown_error";
+      const hasNext = index < modelCandidates.length - 1;
+      console.warn("[semantic] OpenRouter model candidate failed", {
+        model,
+        index: index + 1,
+        total: modelCandidates.length,
+        reason,
+        raw: (error as Error).message,
+        fallbackToNextModel: isRetryable && hasNext
+      });
+      if (!(isRetryable && hasNext)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("OpenRouter 所有候选模型均失败");
+}
+
+async function parseWithGeminiThenOpenRouter(question: string): Promise<ParseResponse> {
+  try {
+    return await parseWithOpenAICompatible(question, {
+      providerName: "gemini",
+      parserSource: "gemini",
+      apiKey: config.geminiApiKey,
+      baseUrl: config.geminiBaseUrl,
+      model: config.geminiModel,
+      timeoutMs: config.geminiTimeoutMs,
+      maxAttempts: 3
+    });
+  } catch (geminiError) {
+    const geminiReason = classifyModelFailureReason(geminiError);
+    const geminiDetail = buildModelFailureDetail(geminiError);
+    console.warn("[semantic] Gemini 解析失败，尝试回退 OpenRouter:", {
+      provider: "gemini",
+      raw: (geminiError as Error).message,
+      normalizedReason: geminiReason,
+      detail: geminiDetail
+    });
+
+    try {
+      return await parseWithOpenRouterCandidates(question);
+    } catch (openrouterError) {
+      const openrouterReason = classifyModelFailureReason(openrouterError);
+      const openrouterDetail = buildModelFailureDetail(openrouterError);
+      const chainedError = new Error(
+        `gemini_failed(${geminiReason}): ${geminiDetail}; openrouter_failed(${openrouterReason}): ${openrouterDetail}`
+      );
+      throw chainedError;
     }
   }
 }
@@ -832,6 +1026,27 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
     return withParserSource(parseQuestionByRules(question), "rule");
   }
 
+  if (provider === "gemini") {
+    try {
+      return await parseWithGeminiThenOpenRouter(question);
+    } catch (error) {
+      const reason = classifyModelFailureReason(error);
+      const detail = buildModelFailureDetail(error);
+      console.warn("[semantic] Gemini + OpenRouter 均失败，回退规则解析:", {
+        provider: "gemini",
+        raw: (error as Error).message,
+        normalizedReason: reason,
+        detail
+      });
+      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      return {
+        ...fallback,
+        parserFailureReason: reason,
+        parserFailureDetail: detail
+      };
+    }
+  }
+
   if (provider === "groq") {
     try {
       return await parseWithOpenAICompatible(question, {
@@ -840,7 +1055,8 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
         apiKey: config.groqApiKey,
         baseUrl: config.groqBaseUrl,
         model: config.groqModel,
-        timeoutMs: config.groqTimeoutMs
+        timeoutMs: config.groqTimeoutMs,
+        maxAttempts: 3
       });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
@@ -862,18 +1078,7 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
 
   if (provider === "openrouter") {
     try {
-      return await parseWithOpenAICompatible(question, {
-        providerName: "openrouter",
-        parserSource: "openrouter",
-        apiKey: config.openrouterApiKey,
-        baseUrl: config.openrouterBaseUrl,
-        model: config.openrouterModel,
-        timeoutMs: config.openrouterTimeoutMs,
-        extraHeaders: {
-          ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
-          "X-Title": config.openrouterAppName
-        }
-      });
+      return await parseWithOpenRouterCandidates(question);
     } catch (error) {
       const reason = classifyModelFailureReason(error);
       const detail = buildModelFailureDetail(error);
@@ -898,6 +1103,42 @@ export async function parseQuestionSmart(question: string): Promise<ParseRespons
 
 export async function answerGeneralQuestion(question: string): Promise<GeneralChatResponse> {
   const provider = config.llmProvider.trim().toLowerCase();
+  if (provider === "gemini") {
+    try {
+      return await chatWithOpenAICompatible(question, {
+        providerName: "gemini",
+        parserSource: "gemini",
+        apiKey: config.geminiApiKey,
+        baseUrl: config.geminiBaseUrl,
+        model: config.geminiModel,
+        timeoutMs: config.geminiTimeoutMs,
+        maxAttempts: 3
+      });
+    } catch (geminiError) {
+      console.warn("[chat] Gemini 对话失败，尝试 OpenRouter:", (geminiError as Error).message);
+      try {
+        return await chatWithOpenAICompatible(question, {
+          providerName: "openrouter",
+          parserSource: "openrouter",
+          apiKey: config.openrouterApiKey,
+          baseUrl: config.openrouterBaseUrl,
+          model: config.openrouterModel,
+          timeoutMs: config.openrouterTimeoutMs,
+          extraHeaders: {
+            ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+            "X-Title": config.openrouterAppName
+          }
+        });
+      } catch (openrouterError) {
+        console.warn("[chat] OpenRouter 对话失败，回退默认回复:", (openrouterError as Error).message);
+        return {
+          summary: "你好，我是空间查询助手。你也可以直接问我空间问题，例如“鼓楼区公园有多少个”。",
+          parserSource: "rule_fallback"
+        };
+      }
+    }
+  }
+
   if (provider === "groq") {
     try {
       return await chatWithOpenAICompatible(question, {

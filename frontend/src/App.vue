@@ -72,7 +72,7 @@ interface BufferOverlay {
   radiusMeters: number;
 }
 
-type ParserSource = "groq" | "openrouter" | "rule" | "rule_fallback";
+type ParserSource = "gemini" | "groq" | "openrouter" | "rule" | "rule_fallback";
 
 interface ChatMessage {
   id: number;
@@ -184,6 +184,9 @@ function pushMessage(message: Omit<ChatMessage, "id">): void {
 }
 
 function parserSourceLabel(source: ParserSource | undefined): string {
+  if (source === "gemini") {
+    return "Gemini 模型";
+  }
   if (source === "groq") {
     return "Groq 模型";
   }

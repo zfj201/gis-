@@ -66,6 +66,8 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "“多少/几个/总数/数量” => intent=count 且 aggregation.type=count。",
     "“为/等于/就是/是/：” => 精确匹配 operator='='。",
     "“包含/含有/相关/类似” => 模糊匹配 operator='like'，并使用 %value%。",
+    "当句子包含“有哪些/列表/清单/名录”等问句尾词时，这些词不是检索关键词，必须从 value 中剔除。",
+    "例如“名称包含生态的有哪些”应提取 value='生态'；“名称含有湿地的公园列表”应提取 value='湿地'。",
     "“附近/周边/X米内/X公里内” => intent=buffer_search。",
     "“最近/最近的/nearest” => intent=nearest。"
   ].join("\n");
@@ -148,6 +150,67 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           aggregation: { type: "count" },
           limit: maxLimit,
           output: { fields: [], returnGeometry: false }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "公园名称包含生态的有哪些"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.95,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: defaultLayerKey,
+          attributeFilter: [{ field: "名称", operator: "like", value: "%生态%" }],
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "名称含有湿地的公园列表"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.95,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: defaultLayerKey,
+          attributeFilter: [{ field: "名称", operator: "like", value: "%湿地%" }],
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "给我一份区县维度的公园数量统计"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.95,
+        followUpQuestion: null,
+        dsl: {
+          intent: "group_stat",
+          targetLayer: defaultLayerKey,
+          attributeFilter: [],
+          aggregation: { type: "group_count", groupBy: ["区县"] },
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: false },
+          sort: { by: "区县", order: "asc" }
         }
       })
     },

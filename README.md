@@ -67,7 +67,11 @@ npm run dev:frontend
 - `MAX_REGISTERED_SERVICES`（最大可注册服务数，默认 `20`）
 - `DEFAULT_RADIUS_METERS`（默认 `5000`）
 - `MAX_RADIUS_METERS`（默认 `0`，`<=0` 表示不限制）
-- `LLM_PROVIDER`（`rule` / `groq` / `openrouter`，默认 `rule`）
+- `LLM_PROVIDER`（`rule` / `gemini` / `groq` / `openrouter`，默认 `rule`）
+- `GEMINI_API_KEY`（启用 Gemini 必填）
+- `GEMINI_BASE_URL`（默认 `https://generativelanguage.googleapis.com/v1beta/openai`）
+- `GEMINI_MODEL`（默认 `gemini-2.0-flash`）
+- `GEMINI_TIMEOUT_MS`（默认 `12000`）
 - `GROQ_API_KEY`（启用 Groq 必填）
 - `GROQ_BASE_URL`（默认 `https://api.groq.com/openai/v1`）
 - `GROQ_MODEL`（默认 `llama-3.1-8b-instant`）
@@ -79,10 +83,11 @@ npm run dev:frontend
 - `OPENROUTER_SITE_URL`（可选，站点 URL）
 - `OPENROUTER_APP_NAME`（可选，应用名，默认 `gis-semantic-query`）
 
-OpenRouter Free 接入步骤：
+Gemini 优先（失败回退 OpenRouter Free）接入步骤：
 1. 复制 `backend/.env.example` 为 `backend/.env`
-2. 设置 `LLM_PROVIDER=openrouter`
-3. 填写 `OPENROUTER_API_KEY`
+2. 设置 `LLM_PROVIDER=gemini`
+3. 填写 `GEMINI_API_KEY`
+4. 填写 `OPENROUTER_API_KEY`（作为 Gemini 失败时的自动回退）
 
 ## Example Questions
 
@@ -96,3 +101,35 @@ OpenRouter Free 接入步骤：
 - 支持手动添加多个 `FeatureServer`，自动发现子图层并可显示/隐藏。
 - 语义查询采用“自动图层路由 + 歧义追问”，当前版本一次仅执行单图层查询。
 - 图层配置会持久化到 `backend/data/layer-registry.json`。
+
+## 自动回归测试（100 条问句）
+
+用例文件：
+- `backend/testcases/chat-query-cases.json`
+
+一键执行（会自动拉起 backend，并逐条写记录再生成报告）：
+
+```bash
+npm run test:chat
+```
+
+默认输出目录：
+- 记录文件：`docs/test-reports/chat_regression_YYYYMMDD_HHmmss.records.jsonl`
+- 报告文件：`docs/test-reports/chat_regression_YYYYMMDD_HHmmss.report.md`
+
+说明：
+- 每条问句执行后会立刻追加一行 JSON 记录（JSONL）。
+- 每条记录至少包含：`reply`、`targetLayer`、`parser`（含回退失败原因）、`dsl`、`queryPlan`、`fullResponse`。
+- 最终 Markdown 报告是从该记录文件聚合生成。
+
+可选参数（示例）：
+
+```bash
+npm run test:chat -- --timeout-ms=60000 --base-url=http://127.0.0.1:3300
+```
+
+仅根据已有记录文件重建报告：
+
+```bash
+npm run test:chat -- --from-records=docs/test-reports/chat_regression_xxx.records.jsonl
+```

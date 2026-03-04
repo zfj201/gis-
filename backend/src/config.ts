@@ -11,6 +11,13 @@ function parseHosts(raw: string): string[] {
     .filter(Boolean);
 }
 
+function parseCsv(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3300),
   host: process.env.HOST ?? "0.0.0.0",
@@ -20,6 +27,11 @@ export const config = {
   maxRadiusMeters: Number(process.env.MAX_RADIUS_METERS ?? 0),
   defaultRadiusMeters: Number(process.env.DEFAULT_RADIUS_METERS ?? 5000),
   llmProvider: process.env.LLM_PROVIDER ?? "rule",
+  geminiApiKey: process.env.GEMINI_API_KEY ?? "",
+  geminiBaseUrl:
+    process.env.GEMINI_BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta/openai",
+  geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
+  geminiTimeoutMs: Number(process.env.GEMINI_TIMEOUT_MS ?? 12000),
   groqApiKey: process.env.GROQ_API_KEY ?? "",
   groqBaseUrl: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
   groqModel: process.env.GROQ_MODEL ?? "llama-3.1-8b-instant",
@@ -27,6 +39,7 @@ export const config = {
   openrouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
   openrouterBaseUrl: process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1",
   openrouterModel: process.env.OPENROUTER_MODEL ?? "openrouter/free",
+  openrouterFallbackModels: parseCsv(process.env.OPENROUTER_FALLBACK_MODELS ?? "qwen/qwen3-4b:free"),
   openrouterTimeoutMs: Number(process.env.OPENROUTER_TIMEOUT_MS ?? 12000),
   openrouterSiteUrl: process.env.OPENROUTER_SITE_URL ?? "",
   openrouterAppName: process.env.OPENROUTER_APP_NAME ?? "gis-semantic-query",

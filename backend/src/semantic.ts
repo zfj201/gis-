@@ -131,7 +131,11 @@ function chooseLayerByHint(
 }
 
 function inferIntent(question: string): SpatialQueryDSL["intent"] {
-  if (/按.*(区县|行政区划|乡镇).*(统计|分组)|各(区县|行政区划|乡镇)/.test(question)) {
+  if (
+    /(按|按照|以|基于).*(区县|行政区划|县级政区|乡镇|维度).*(统计|分组|汇总)|各(区县|行政区划|乡镇).*(数量|个数|分布|多少)|各区县分别有多少|(?:区县|行政区划).*(维度|分组|分布|汇总)/.test(
+      question
+    )
+  ) {
     return "group_stat";
   }
   if (/多少|几个|总数|数量/.test(question)) {
@@ -662,6 +666,9 @@ export function parseQuestion(question: string): ParseResponse {
   const intent = inferIntent(normalized);
   const radiusMeters = parseRadiusMeters(normalized);
   const coordinate = parseCoordinate(normalized);
+  const isCoordinateBufferQuery = Boolean(
+    intent === "buffer_search" && coordinate && /(附近|周边|以内|内)/.test(normalized)
+  );
   const limit =
     parseTopLimit(normalized, intent === "nearest" ? config.nearestMaxK : config.queryMaxFeatures) ??
     (intent === "nearest" ? Math.max(1, config.nearestDefaultK) : config.queryMaxFeatures);
@@ -669,10 +676,12 @@ export function parseQuestion(question: string): ParseResponse {
   const keyword = parseKeyword(normalized);
   const countyField = findCountyField(fallbackLayer);
   const nameField = findNameField(fallbackLayer);
-  const explicitCondition = extractExplicitFieldCondition(
-    normalized,
-    fallbackLayer.fields.filter((field) => field.queryable).map((field) => field.name)
-  );
+  const explicitCondition = isCoordinateBufferQuery
+    ? null
+    : extractExplicitFieldCondition(
+        normalized,
+        fallbackLayer.fields.filter((field) => field.queryable).map((field) => field.name)
+      );
 
   const dsl: SpatialQueryDSL = createBaseDsl(
     fallbackLayer.layerKey,

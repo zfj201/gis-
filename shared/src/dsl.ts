@@ -87,7 +87,7 @@ export const spatialQueryDslSchema = z.object({
 });
 
 export type SpatialQueryDSL = z.infer<typeof spatialQueryDslSchema>;
-export type ParserSource = "groq" | "openrouter" | "rule" | "rule_fallback";
+export type ParserSource = "gemini" | "groq" | "openrouter" | "rule" | "rule_fallback";
 
 export interface ParseResponse {
   dsl: SpatialQueryDSL;
