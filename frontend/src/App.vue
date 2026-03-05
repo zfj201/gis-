@@ -38,11 +38,27 @@ interface QueryPlanLike {
   distance?: number | null;
   units?: string | null;
   geometryType?: string | null;
-  analysisType?: "nearest" | string;
+  analysisType?: "nearest" | "spatial_relation" | "spatial_join_count" | "multi_ring_stat" | string;
   nearestMeta?: {
     topK?: number;
     radiusUsedMeters?: number;
     candidateCount?: number;
+    sourceMode?: "center" | "source_layer" | string;
+  };
+  relationMeta?: {
+    relation?: string;
+    sourceLayer?: string;
+    sourceCount?: number;
+  };
+  joinMeta?: {
+    relation?: string;
+    sourceLayer?: string;
+    sourceEvaluated?: number;
+    sourceTruncated?: boolean;
+  };
+  multiRingMeta?: {
+    radiiMeters?: number[];
+    ringOnly?: boolean;
     sourceMode?: "center" | "source_layer" | string;
   };
 }
@@ -107,6 +123,7 @@ interface ChatMessage {
     candidateCount: number;
     sourceMode: string;
   } | null;
+  analysisMetaLines?: string[] | null;
   semanticMeta?: {
     retrievalHits: number;
     modelAttempts: number;
@@ -142,7 +159,7 @@ const chatMessages = ref<ChatMessage[]>([
   {
     id: 1,
     role: "assistant",
-    text: "你好，我是空间查询助手。你可以问我：鼓楼区公园有多少个、列出仓山区前20个公园、某点500米内的公园。"
+    text: "你好，我是空间查询助手。你可以问我：鼓楼区公园有多少个、标准名称为南二环的道路街巷相交的门牌号码、x:13303000,y:2996000 500米、1公里、2公里内公园数量对比。"
   }
 ]);
 const chatStreamEl = ref<HTMLDivElement | null>(null);
@@ -188,6 +205,63 @@ function nearestMetaFromPlan(plan: Record<string, unknown> | null | undefined): 
     candidateCount: Number(queryPlan.nearestMeta.candidateCount ?? 0),
     sourceMode: String(queryPlan.nearestMeta.sourceMode ?? "")
   };
+}
+
+function relationLabel(relation: string | undefined): string {
+  if (relation === "intersects") {
+    return "相交";
+  }
+  if (relation === "contains") {
+    return "包含";
+  }
+  if (relation === "within") {
+    return "被包含";
+  }
+  if (relation === "disjoint") {
+    return "相离";
+  }
+  if (relation === "touches") {
+    return "接触";
+  }
+  if (relation === "overlaps") {
+    return "重叠";
+  }
+  return relation ?? "unknown";
+}
+
+function analysisMetaLinesFromPlan(plan: Record<string, unknown> | null | undefined): string[] | null {
+  if (!plan) {
+    return null;
+  }
+  const queryPlan = plan as QueryPlanLike;
+  if (queryPlan.analysisType === "nearest") {
+    return null;
+  }
+  if (queryPlan.analysisType === "spatial_relation" && queryPlan.relationMeta) {
+    return [
+      `空间关系：${relationLabel(queryPlan.relationMeta.relation)} · 源图层 ${
+        queryPlan.relationMeta.sourceLayer ?? "-"
+      } · 源要素 ${Number(queryPlan.relationMeta.sourceCount ?? 0)}`
+    ];
+  }
+  if (queryPlan.analysisType === "spatial_join_count" && queryPlan.joinMeta) {
+    const truncated = queryPlan.joinMeta.sourceTruncated ? "（已截断）" : "";
+    return [
+      `空间 Join：${relationLabel(queryPlan.joinMeta.relation)} · 源图层 ${
+        queryPlan.joinMeta.sourceLayer ?? "-"
+      } · 评估 ${Number(queryPlan.joinMeta.sourceEvaluated ?? 0)}${truncated}`
+    ];
+  }
+  if (queryPlan.analysisType === "multi_ring_stat" && queryPlan.multiRingMeta) {
+    const radii = Array.isArray(queryPlan.multiRingMeta.radiiMeters)
+      ? queryPlan.multiRingMeta.radiiMeters.map((value) => Number(value)).join("/")
+      : "";
+    const ringMode = queryPlan.multiRingMeta.ringOnly ? "环带增量" : "累计";
+    return [
+      `多环缓冲：${radii || "-"}m · ${ringMode} · 来源 ${String(queryPlan.multiRingMeta.sourceMode ?? "-")}`
+    ];
+  }
+  return null;
 }
 
 function pushMessage(message: Omit<ChatMessage, "id">): void {
@@ -744,6 +818,7 @@ async function runQuery(): Promise<void> {
           }
         : undefined,
       nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null),
+      analysisMetaLines: analysisMetaLinesFromPlan(parsed.queryPlan ?? null),
       semanticMeta: parsed.semanticMeta
         ? {
             retrievalHits: Number(parsed.semanticMeta.retrievalHits ?? 0),
@@ -813,6 +888,13 @@ onBeforeUnmount(() => {
             <div v-if="message.role === 'assistant' && message.nearestMeta" class="msg-meta">
               最近邻 Top{{ message.nearestMeta.topK }} · 候选 {{ message.nearestMeta.candidateCount }} · 使用半径
               {{ message.nearestMeta.radiusUsedMeters }}m
+            </div>
+            <div
+              v-for="(line, idx) in message.analysisMetaLines || []"
+              :key="`analysis-${message.id}-${idx}`"
+              class="msg-meta"
+            >
+              {{ line }}
             </div>
             <div v-if="message.role === 'assistant' && message.targetLayerName" class="msg-meta">
               目标图层：{{ message.targetLayerName }}

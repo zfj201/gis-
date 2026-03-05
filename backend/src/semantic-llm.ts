@@ -153,6 +153,19 @@ function hasCountyFilter(dsl: SpatialQueryDSL): boolean {
   ) || exprContainsCountyEquality(dsl.filterExpr);
 }
 
+function isSpatialRelationText(question: string): boolean {
+  return /(相交|相离|接触|重叠|被.+包含|包含.+的)/.test(question);
+}
+
+function isSpatialJoinCountText(question: string): boolean {
+  return /每个.+内.+(有多少|数量|个数|多少)/.test(question);
+}
+
+function isMultiRingText(question: string): boolean {
+  const distanceTokens = question.match(/(\d+(?:\.\d+)?)\s*(km|公里|千米|m|米)/gi) ?? [];
+  return distanceTokens.length >= 2 && /(数量|统计|对比|分别)/.test(question);
+}
+
 function exprContainsOr(expr: FilterExprNode | undefined): boolean {
   if (!expr) {
     return false;
@@ -301,7 +314,7 @@ function normalizeIntent(raw: unknown): SpatialQueryDSL["intent"] {
   return "search";
 }
 
-function normalizeSpatialType(raw: unknown): "buffer" | "intersects" | "nearest" | undefined {
+function normalizeSpatialType(raw: unknown): "buffer" | "intersects" | "nearest" | "relation" | undefined {
   const value = String(raw ?? "").trim().toLowerCase();
   if (!value) {
     return undefined;
@@ -314,6 +327,37 @@ function normalizeSpatialType(raw: unknown): "buffer" | "intersects" | "nearest"
   }
   if (value === "nearest") {
     return "nearest";
+  }
+  if (value === "relation" || value === "spatial_relation") {
+    return "relation";
+  }
+  return undefined;
+}
+
+function normalizeSpatialRelation(
+  raw: unknown
+): "intersects" | "contains" | "within" | "disjoint" | "touches" | "overlaps" | undefined {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) {
+    return undefined;
+  }
+  if (["intersects", "intersect", "相交"].includes(value)) {
+    return "intersects";
+  }
+  if (["contains", "contain", "包含"].includes(value)) {
+    return "contains";
+  }
+  if (["within", "inside", "被包含"].includes(value)) {
+    return "within";
+  }
+  if (["disjoint", "separate", "相离"].includes(value)) {
+    return "disjoint";
+  }
+  if (["touches", "touch", "接触"].includes(value)) {
+    return "touches";
+  }
+  if (["overlaps", "overlap", "重叠"].includes(value)) {
+    return "overlaps";
   }
   return undefined;
 }
@@ -543,12 +587,23 @@ function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
 
   if (spatialFilter && typeof spatialFilter === "object") {
     const radius = Number(spatialFilter.radius);
+    const distances = Array.isArray(spatialFilter.distances)
+      ? spatialFilter.distances
+        .map((item) => Number(item))
+        .filter((item) => Number.isFinite(item) && item > 0)
+      : undefined;
     normalized.spatialFilter = {
       type: normalizeSpatialType(spatialFilter.type),
+      relation: normalizeSpatialRelation(spatialFilter.relation),
+      joinMode:
+        spatialFilter.joinMode === "count_by_source" ? "count_by_source" : undefined,
       radius: Number.isNaN(radius) ? undefined : radius,
+      distances: distances && distances.length > 0 ? distances : undefined,
       unit: normalizeUnit(spatialFilter.unit),
       ringOnly:
         spatialFilter.ringOnly === undefined ? undefined : Boolean(spatialFilter.ringOnly),
+      excludeSelf:
+        spatialFilter.excludeSelf === undefined ? undefined : Boolean(spatialFilter.excludeSelf),
       sourceLayer:
         spatialFilter.sourceLayer === undefined ? undefined : String(spatialFilter.sourceLayer),
       sourceAttributeFilter: normalizeFilterList(spatialFilter.sourceAttributeFilter),
@@ -692,6 +747,27 @@ function isModelResultConsistent(question: string, parsed: ParseResponse): boole
     !exprContainsOr(dsl.spatialFilter?.sourceFilterExpr)
   ) {
     return false;
+  }
+
+  if (isSpatialRelationText(question)) {
+    if (dsl.spatialFilter?.type !== "relation") {
+      return false;
+    }
+    if (!dsl.spatialFilter?.relation) {
+      return false;
+    }
+  }
+
+  if (isSpatialJoinCountText(question)) {
+    if (dsl.spatialFilter?.joinMode !== "count_by_source") {
+      return false;
+    }
+  }
+
+  if (isMultiRingText(question)) {
+    if (dsl.spatialFilter?.type !== "buffer" || !dsl.spatialFilter?.distances || dsl.spatialFilter.distances.length < 2) {
+      return false;
+    }
   }
 
   if (hasCountyText(question) && !hasCountyFilter(dsl)) {

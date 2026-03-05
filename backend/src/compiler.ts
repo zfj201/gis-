@@ -20,12 +20,22 @@ function normalizeLikeValue(value: string): string {
 }
 
 function splitListValues(rawValue: string): string[] {
+  const normalizeToken = (token: string): string =>
+    token
+      .trim()
+      .replace(/^[“"'`]+|[”"'`]+$/g, "")
+      // Tolerate natural-language tails in collection filters, e.g. "45855中".
+      .replace(/(?:之)?中$/g, "")
+      .replace(/里$/g, "")
+      .replace(/内$/g, "")
+      .trim();
+
   return rawValue
     .trim()
     .replace(/^[（(]\s*/, "")
     .replace(/\s*[）)]$/, "")
     .split(/[，,、]/)
-    .map((item) => item.trim())
+    .map((item) => normalizeToken(item))
     .filter(Boolean);
 }
 
@@ -199,6 +209,26 @@ function buildWhere(dsl: SpatialQueryDSL, fieldTypes: Map<string, string>): stri
   return buildWhereFromExpr(expr, fieldTypes);
 }
 
+function relationToSpatialRel(
+  relation: NonNullable<NonNullable<SpatialQueryDSL["spatialFilter"]>["relation"]> | undefined
+): string {
+  switch (relation) {
+    case "contains":
+      return "esriSpatialRelContains";
+    case "within":
+      return "esriSpatialRelWithin";
+    case "disjoint":
+      return "esriSpatialRelDisjoint";
+    case "touches":
+      return "esriSpatialRelTouches";
+    case "overlaps":
+      return "esriSpatialRelOverlaps";
+    case "intersects":
+    default:
+      return "esriSpatialRelIntersects";
+  }
+}
+
 function normalizeOutFields(
   dsl: SpatialQueryDSL,
   allowedFields: Set<string>,
@@ -341,6 +371,19 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
       plan.spatialRel = "esriSpatialRelIntersects";
       plan.distance = radius;
       plan.units = "esriSRUnit_Meter";
+    }
+  }
+
+  if (dsl.spatialFilter?.type === "relation") {
+    const center = dsl.spatialFilter.center;
+    if (center) {
+      plan.geometry = {
+        x: center.x,
+        y: center.y,
+        spatialReference: center.spatialReference ?? { wkid: 3857 }
+      };
+      plan.geometryType = "esriGeometryPoint";
+      plan.spatialRel = relationToSpatialRel(dsl.spatialFilter.relation);
     }
   }
 

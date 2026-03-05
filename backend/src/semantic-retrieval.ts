@@ -84,7 +84,9 @@ const DEFAULT_SYNONYMS: SemanticSynonyms = {
     count: ["多少", "几个", "数量", "总数", "count"],
     group_stat: ["分组", "统计", "汇总", "维度"],
     buffer_search: ["附近", "周边", "内", "范围", "缓冲"],
-    nearest: ["最近", "nearest"]
+    nearest: ["最近", "nearest"],
+    relation: ["相交", "包含", "被包含", "相离", "接触", "重叠"],
+    join_count: ["每个", "内", "数量"]
   },
   operator: {
     "=": ["为", "等于", "是", "就是", ":", "："],

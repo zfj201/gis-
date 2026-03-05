@@ -20,7 +20,7 @@ const spatialActionSignals: Array<{ pattern: RegExp; score: number; reason: stri
     reason: "坐标格式命中"
   },
   {
-    pattern: /(附近|周边|缓冲|最近|nearest|相交|intersects|范围|半径|距离)/i,
+    pattern: /(附近|周边|缓冲|最近|nearest|相交|相离|接触|重叠|包含|被包含|intersects|within|contains|范围|半径|距离)/i,
     score: 2.2,
     reason: "空间关系词命中"
   },

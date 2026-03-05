@@ -66,6 +66,17 @@ function cleanValue(value: string): string {
   return next;
 }
 
+function cleanCollectionValue(value: string): string {
+  let next = cleanValue(value);
+  // Handle Chinese postpositions that are often attached to IN/NOT IN tails, e.g. "45854、45855中".
+  next = next
+    .replace(/(?:之)?中$/g, "")
+    .replace(/里$/g, "")
+    .replace(/内$/g, "")
+    .trim();
+  return next;
+}
+
 function buildFieldLookup(layer: LayerDescriptor): Map<string, string> {
   const lookup = new Map<string, string>();
   for (const field of layer.fields.filter((item) => item.queryable)) {
@@ -241,14 +252,17 @@ function extractFieldCondition(
         continue;
       }
 
-      const value = cleanValue(explicitMatch[2]);
+      const operator = parseOperatorToken(explicitMatch[1]);
+      const value = operator === "in" || operator === "not in"
+        ? cleanCollectionValue(explicitMatch[2])
+        : cleanValue(explicitMatch[2]);
       if (!value) {
         continue;
       }
 
       return {
         field,
-        operator: parseOperatorToken(explicitMatch[1]),
+        operator,
         value
       };
     }
@@ -333,6 +347,17 @@ function normalizeExprNode(
         ...expr,
         field: resolvedField,
         value: ""
+      };
+    }
+    if (expr.operator === "in" || expr.operator === "not in") {
+      const normalizedCollection = cleanCollectionValue(String(expr.value ?? ""));
+      if (!normalizedCollection) {
+        return null;
+      }
+      return {
+        ...expr,
+        field: resolvedField,
+        value: normalizedCollection
       };
     }
     if (!cleanedValue) {
@@ -613,13 +638,23 @@ function normalizeFilterValues(
       withCountCleanup.spatialFilter?.sourceLayer &&
       (withCountCleanup.spatialFilter?.sourceFilterExpr || withCountCleanup.spatialFilter?.sourceAttributeFilter?.length)
   );
+  const isSourceRelationMode = Boolean(
+    withCountCleanup.spatialFilter?.type === "relation" &&
+      withCountCleanup.spatialFilter?.sourceLayer &&
+      (withCountCleanup.spatialFilter?.sourceFilterExpr || withCountCleanup.spatialFilter?.sourceAttributeFilter?.length)
+  );
+  const isMultiRingMode = Boolean(
+    withCountCleanup.spatialFilter?.type === "buffer" &&
+      Array.isArray(withCountCleanup.spatialFilter?.distances) &&
+      withCountCleanup.spatialFilter.distances.length > 1
+  );
   const isNearestMode = withCountCleanup.intent === "nearest";
   const hasFilterExpr = Boolean(withCountCleanup.filterExpr);
   const explicit = extractFieldCondition(question, layer);
   const shouldApplyForcedHint = Boolean(
     explicit && shouldForceExplicitOperator(explicit.operator) && canReplaceWithExplicitCondition(withCountCleanup, explicit)
   );
-  const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode || isNearestMode
+  const withOperatorHint = isSourceBufferMode || isSourceRelationMode || isCoordinateBufferMode || isNearestMode || isMultiRingMode
     ? withCountCleanup
     : (shouldApplyForcedHint || !hasFilterExpr)
       ? applyOperatorHint(question, withCountCleanup, layer)

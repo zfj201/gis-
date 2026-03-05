@@ -18,6 +18,7 @@ const coordinatePatterns = [
   /(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/,
   /x\s*[:：]\s*(-?\d+(?:\.\d+)?)\s*[，,\s]+y\s*[:：]\s*(-?\d+(?:\.\d+)?)/i
 ];
+type SpatialRelationType = "intersects" | "contains" | "within" | "disjoint" | "touches" | "overlaps";
 
 function parseRadiusMeters(question: string): number | undefined {
   const match = question.match(/(\d+(?:\.\d+)?)\s*(km|公里|千米|m|米)/i);
@@ -35,6 +36,25 @@ function parseRadiusMeters(question: string): number | undefined {
     return Math.round(value * 1000);
   }
   return Math.round(value);
+}
+
+function parseDistanceListMeters(question: string): number[] {
+  const values: number[] = [];
+  const regex = /(\d+(?:\.\d+)?)\s*(km|公里|千米|m|米)/gi;
+  let match: RegExpExecArray | null = regex.exec(question);
+  while (match) {
+    const value = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    if (Number.isFinite(value) && value > 0) {
+      if (unit === "km" || unit === "公里" || unit === "千米") {
+        values.push(Math.round(value * 1000));
+      } else {
+        values.push(Math.round(value));
+      }
+    }
+    match = regex.exec(question);
+  }
+  return values;
 }
 
 function parseCoordinate(question: string): { x: number; y: number } | undefined {
@@ -718,6 +738,71 @@ function parseCrossLayerBuffer(
   };
 }
 
+function parseSpatialRelationClause(
+  question: string
+): { sourcePart: string; targetPart: string; relation: SpatialRelationType } | null {
+  const normalized = question.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const simpleMatch = normalized.match(/(.+?)\s*(相交|相离|接触|重叠)\s*的?\s*(.+)/);
+  if (simpleMatch?.[1] && simpleMatch[2] && simpleMatch[3]) {
+    const relationMap: Record<string, SpatialRelationType> = {
+      相交: "intersects",
+      相离: "disjoint",
+      接触: "touches",
+      重叠: "overlaps"
+    };
+    return {
+      sourcePart: simpleMatch[1].trim(),
+      targetPart: stripTopLimitPhrase(simpleMatch[3].trim()),
+      relation: relationMap[simpleMatch[2]] ?? "intersects"
+    };
+  }
+
+  const withinMatch = normalized.match(/^被(.+?)包含\s*的?\s*(.+)/);
+  if (withinMatch?.[1] && withinMatch[2]) {
+    return {
+      sourcePart: withinMatch[1].trim(),
+      targetPart: stripTopLimitPhrase(withinMatch[2].trim()),
+      relation: "within"
+    };
+  }
+
+  const containMatch = normalized.match(/^包含(.+?)\s*的?\s*(.+)/);
+  if (containMatch?.[1] && containMatch[2]) {
+    // 避免“名称包含xx”误命中空间关系。
+    if (/(名称|地址|标准名称|门牌号码)/.test(containMatch[1])) {
+      return null;
+    }
+    return {
+      sourcePart: containMatch[1].trim(),
+      targetPart: stripTopLimitPhrase(containMatch[2].trim()),
+      relation: "contains"
+    };
+  }
+
+  return null;
+}
+
+function parseSpatialJoinCountClause(
+  question: string
+): { sourcePart: string; targetPart: string } | null {
+  const match = question.match(/每个(.+?)内(.+?)(?:有多少|数量|个数|多少)/);
+  if (!match?.[1] || !match[2]) {
+    return null;
+  }
+  return {
+    sourcePart: match[1].trim(),
+    targetPart: stripTopLimitPhrase(match[2].trim())
+  };
+}
+
+function isMultiRingCountText(question: string): boolean {
+  return /(数量|统计|对比|分别|有多少|多少个)/.test(question) && /(米|公里|千米|km|m)/i.test(question);
+}
+
 function createBaseDsl(layerKey: string, fields: string[]): SpatialQueryDSL {
   return {
     intent: "search",
@@ -734,10 +819,255 @@ function createBaseDsl(layerKey: string, fields: string[]): SpatialQueryDSL {
 
 export function parseQuestion(question: string): ParseResponse {
   const normalized = question.trim();
+
+  const spatialJoinClause = parseSpatialJoinCountClause(normalized);
+  if (spatialJoinClause) {
+    const sourceHint = geometryHintFromText(spatialJoinClause.sourcePart) ?? "polygon";
+    const targetHint = geometryHintFromText(spatialJoinClause.targetPart);
+    const sourceResolved = chooseLayerByHint(spatialJoinClause.sourcePart, sourceHint);
+    const targetResolved = chooseLayerByHint(spatialJoinClause.targetPart, targetHint);
+    if (!sourceResolved.layer || !targetResolved.layer) {
+      const fallbackLayer = targetResolved.layer ?? layerRegistry.getDefaultLayer();
+      const fallbackDsl = spatialQueryDslSchema.parse({
+        intent: "search",
+        targetLayer: fallbackLayer?.layerKey ?? "fuzhou_parks",
+        attributeFilter: [],
+        aggregation: null,
+        limit: Math.max(1, Math.min(200, config.queryMaxFeatures)),
+        output: {
+          fields: fallbackLayer ? defaultOutputFields(fallbackLayer) : [],
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "relation",
+          relation: "within",
+          joinMode: "count_by_source"
+        }
+      });
+      return {
+        dsl: fallbackDsl,
+        confidence: 0.6,
+        followUpQuestion:
+          sourceResolved.followUpQuestion ??
+          targetResolved.followUpQuestion ??
+          "请明确空间 Join 的源图层和目标图层。",
+        parserSource: "rule"
+      };
+    }
+
+    const sourceFilterResult = extractSourceFilters(spatialJoinClause.sourcePart, sourceResolved.layer);
+    const requestedLimit = parseTopLimitFromQuestion(normalized, 200) ?? 20;
+    const joinDsl = spatialQueryDslSchema.parse({
+      intent: "search",
+      targetLayer: targetResolved.layer.layerKey,
+      attributeFilter: [],
+      aggregation: null,
+      limit: Math.max(1, Math.min(200, requestedLimit)),
+      output: {
+        fields: defaultOutputFields(targetResolved.layer),
+        returnGeometry: true
+      },
+      spatialFilter: {
+        type: "relation",
+        relation: "within",
+        joinMode: "count_by_source",
+        sourceLayer: sourceResolved.layer.layerKey,
+        sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
+        sourceFilterExpr: sourceFilterResult.sourceFilterExpr
+      },
+      locationEntity: {
+        rawText: spatialJoinClause.sourcePart,
+        type: locationTypeFromHint(sourceHint),
+        resolution: "resolved"
+      }
+    });
+    const normalizedResult = normalizeDslByQuestion(normalized, joinDsl);
+    return withWarnings({
+      dsl: normalizedResult.dsl,
+      confidence: 0.86,
+      followUpQuestion: null,
+      parserSource: "rule",
+      normalizedByRule: normalizedResult.normalized
+    }, sourceFilterResult.warnings);
+  }
+
+  const relationClause = parseSpatialRelationClause(normalized);
+  if (relationClause) {
+    const sourceHint = geometryHintFromText(relationClause.sourcePart);
+    const targetHint = geometryHintFromText(relationClause.targetPart);
+    const sourceResolved = chooseLayerByHint(relationClause.sourcePart, sourceHint);
+    const targetResolved = chooseLayerByHint(relationClause.targetPart, targetHint);
+    if (!sourceResolved.layer || !targetResolved.layer) {
+      const fallbackLayer = targetResolved.layer ?? layerRegistry.getDefaultLayer();
+      const fallbackDsl = spatialQueryDslSchema.parse({
+        intent: "search",
+        targetLayer: fallbackLayer?.layerKey ?? "fuzhou_parks",
+        attributeFilter: [],
+        aggregation: null,
+        limit: config.queryMaxFeatures,
+        output: {
+          fields: fallbackLayer ? defaultOutputFields(fallbackLayer) : [],
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "relation",
+          relation: relationClause.relation
+        }
+      });
+      return {
+        dsl: fallbackDsl,
+        confidence: 0.62,
+        followUpQuestion:
+          sourceResolved.followUpQuestion ??
+          targetResolved.followUpQuestion ??
+          "请明确空间关系查询的源图层与目标图层。",
+        parserSource: "rule"
+      };
+    }
+
+    const sourceFilterResult = extractSourceFilters(relationClause.sourcePart, sourceResolved.layer);
+    if (!sourceFilterResult.sourceAttributeFilter.length) {
+      const noSourceDsl = spatialQueryDslSchema.parse({
+        intent: "search",
+        targetLayer: targetResolved.layer.layerKey,
+        attributeFilter: [],
+        aggregation: null,
+        limit: config.queryMaxFeatures,
+        output: {
+          fields: defaultOutputFields(targetResolved.layer),
+          returnGeometry: true
+        },
+        spatialFilter: {
+          type: "relation",
+          relation: relationClause.relation,
+          sourceLayer: sourceResolved.layer.layerKey,
+          sourceAttributeFilter: []
+        }
+      });
+      return withWarnings({
+        dsl: noSourceDsl,
+        confidence: 0.68,
+        followUpQuestion: `请明确源要素条件（当前源图层：${sourceResolved.layer.name}），例如“标准名称为南二环的${sourceResolved.layer.name}相交的${targetResolved.layer.name}”。`,
+        parserSource: "rule"
+      }, sourceFilterResult.warnings);
+    }
+
+    const intent = /(多少|数量|总数|有几个)/.test(normalized) ? "count" : "search";
+    const targetFilterResult = parseTargetFilterExpr(relationClause.targetPart, targetResolved.layer);
+    const relationDsl = spatialQueryDslSchema.parse({
+      intent,
+      targetLayer: targetResolved.layer.layerKey,
+      attributeFilter: targetFilterResult.flatConditions,
+      filterExpr: targetFilterResult.expr ?? undefined,
+      aggregation: intent === "count" ? { type: "count" } : null,
+      limit: config.queryMaxFeatures,
+      output: {
+        fields: defaultOutputFields(targetResolved.layer),
+        returnGeometry: intent === "count" ? false : true
+      },
+      spatialFilter: {
+        type: "relation",
+        relation: relationClause.relation,
+        sourceLayer: sourceResolved.layer.layerKey,
+        sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
+        sourceFilterExpr: sourceFilterResult.sourceFilterExpr
+      },
+      locationEntity: {
+        rawText: relationClause.sourcePart,
+        type: locationTypeFromHint(sourceHint),
+        resolution: "resolved"
+      }
+    });
+    const normalizedResult = normalizeDslByQuestion(normalized, relationDsl);
+    return withWarnings({
+      dsl: normalizedResult.dsl,
+      confidence: 0.88,
+      followUpQuestion: null,
+      parserSource: "rule",
+      normalizedByRule: normalizedResult.normalized
+    }, mergeWarnings(sourceFilterResult.warnings, targetFilterResult.warnings));
+  }
+
+  const distanceList = parseDistanceListMeters(normalized);
+  if (distanceList.length >= 2 && isMultiRingCountText(normalized)) {
+    const center = parseCoordinate(normalized);
+    const target = resolveTargetLayer(normalized);
+    const fallbackLayer = target.layer ?? layerRegistry.getDefaultLayer();
+    if (!fallbackLayer) {
+      const fallbackDsl = spatialQueryDslSchema.parse({
+        intent: "search",
+        targetLayer: "fuzhou_parks",
+        attributeFilter: [],
+        aggregation: null,
+        limit: distanceList.length,
+        output: {
+          fields: [],
+          returnGeometry: false
+        },
+        spatialFilter: {
+          type: "buffer",
+          distances: distanceList,
+          ringOnly: true
+        }
+      });
+      return {
+        dsl: fallbackDsl,
+        confidence: 0.55,
+        followUpQuestion: "当前没有可查询图层，请先添加图层后重试。",
+        parserSource: "rule"
+      };
+    }
+
+    const multiRingDsl = spatialQueryDslSchema.parse({
+      intent: "search",
+      targetLayer: fallbackLayer.layerKey,
+      attributeFilter: [],
+      aggregation: null,
+      limit: distanceList.length,
+      output: {
+        fields: defaultOutputFields(fallbackLayer),
+        returnGeometry: false
+      },
+      spatialFilter: {
+        type: "buffer",
+        distances: distanceList,
+        ringOnly: true,
+        center: center
+          ? {
+              x: center.x,
+              y: center.y,
+              spatialReference: { wkid: 3857 }
+            }
+          : undefined
+      },
+      locationEntity: center
+        ? {
+            rawText: `${center.x},${center.y}`,
+            type: "point",
+            resolution: "resolved"
+          }
+        : {
+            rawText: normalized,
+            type: "unknown",
+            resolution: "needs_clarification"
+          }
+    });
+    const normalizedResult = normalizeDslByQuestion(normalized, multiRingDsl);
+    return {
+      dsl: normalizedResult.dsl,
+      confidence: center ? 0.87 : 0.66,
+      followUpQuestion: center ? null : "多环缓冲统计需要坐标中心点，请提供 x,y 后重试。",
+      parserSource: "rule",
+      normalizedByRule: normalizedResult.normalized
+    };
+  }
+
   const nearestClause = parseNearestClause(normalized);
   if (nearestClause) {
     const requestedLimit = parseTopLimitFromQuestion(normalized, config.nearestMaxK);
     const nearestLimit = requestedLimit ?? Math.max(1, config.nearestDefaultK);
+    const nearestWithin = parseRadiusMeters(normalized);
+    const excludeSelf = !/(包含自身|含自身|包括自身)/.test(normalized);
     const sourceCoordinate = parseCoordinate(nearestClause.sourcePart) ?? parseCoordinate(normalized);
     const targetHint = geometryHintFromText(nearestClause.targetPart);
     const targetResolved = chooseLayerByHint(nearestClause.targetPart, targetHint);
@@ -754,7 +1084,9 @@ export function parseQuestion(question: string): ParseResponse {
           returnGeometry: true
         },
         spatialFilter: {
-          type: "nearest"
+          type: "nearest",
+          radius: nearestWithin,
+          excludeSelf
         }
       });
       return {
@@ -778,6 +1110,8 @@ export function parseQuestion(question: string): ParseResponse {
         },
         spatialFilter: {
           type: "nearest",
+          radius: nearestWithin,
+          excludeSelf,
           center: {
             x: sourceCoordinate.x,
             y: sourceCoordinate.y,
@@ -814,7 +1148,9 @@ export function parseQuestion(question: string): ParseResponse {
           returnGeometry: true
         },
         spatialFilter: {
-          type: "nearest"
+          type: "nearest",
+          radius: nearestWithin,
+          excludeSelf
         }
       });
       return {
@@ -839,6 +1175,8 @@ export function parseQuestion(question: string): ParseResponse {
         },
         spatialFilter: {
           type: "nearest",
+          radius: nearestWithin,
+          excludeSelf,
           sourceLayer: sourceResolved.layer.layerKey,
           sourceAttributeFilter: []
         }
@@ -861,11 +1199,13 @@ export function parseQuestion(question: string): ParseResponse {
         fields: defaultOutputFields(targetResolved.layer),
         returnGeometry: true
       },
-      spatialFilter: {
-        type: "nearest",
-        sourceLayer: sourceResolved.layer.layerKey,
-        sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
-        sourceFilterExpr: sourceFilterResult.sourceFilterExpr
+        spatialFilter: {
+          type: "nearest",
+          radius: nearestWithin,
+          excludeSelf,
+          sourceLayer: sourceResolved.layer.layerKey,
+          sourceAttributeFilter: sourceFilterResult.sourceAttributeFilter,
+          sourceFilterExpr: sourceFilterResult.sourceFilterExpr
       },
       locationEntity: {
         rawText: nearestClause.sourcePart,
@@ -896,7 +1236,9 @@ export function parseQuestion(question: string): ParseResponse {
         returnGeometry: true
       },
       spatialFilter: {
-        type: "nearest"
+        type: "nearest",
+        radius: parseRadiusMeters(normalized),
+        excludeSelf: !/(包含自身|含自身|包括自身)/.test(normalized)
       }
     });
     return {

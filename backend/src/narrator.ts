@@ -43,6 +43,30 @@ export function summarizeResult(
   payload: Record<string, unknown>,
   layerName = "要素"
 ): string {
+  const multiRingStats = Array.isArray(payload.multiRingStats)
+    ? (payload.multiRingStats as Array<Record<string, unknown>>)
+    : [];
+  if (multiRingStats.length > 0) {
+    const preview = multiRingStats
+      .slice(0, 5)
+      .map((item) => {
+        const radius = Number(item.radius_m ?? 0);
+        const ringCount = Number(item.ring_count ?? 0);
+        return `${radius}米:${ringCount}`;
+      });
+    return `多环缓冲统计完成，共 ${multiRingStats.length} 个圈层，结果示例：${preview.join("，")}。`;
+  }
+
+  const joinStats = Array.isArray(payload.joinStats)
+    ? (payload.joinStats as Array<Record<string, unknown>>)
+    : [];
+  if (joinStats.length > 0) {
+    const preview = joinStats
+      .slice(0, 5)
+      .map((item) => `${String(item._source_name ?? "未命名区域")} ${Number(item._join_count ?? 0)} 个`);
+    return `空间 Join 统计完成，共 ${joinStats.length} 个源对象，示例：${preview.join("，")}。`;
+  }
+
   if (dsl.intent === "count" || dsl.aggregation?.type === "count") {
     const count = Number(payload.count ?? 0);
     return `共检索到 ${count} 个${layerName}。`;

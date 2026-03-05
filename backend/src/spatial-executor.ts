@@ -1,4 +1,4 @@
-import type { QueryPlan, SpatialQueryDSL } from "@gis/shared";
+import type { FilterExprNode, LayerDescriptor, QueryPlan, SpatialQueryDSL } from "@gis/shared";
 import GeometryFactory from "jsts/org/locationtech/jts/geom/GeometryFactory.js";
 import GeoJSONReader from "jsts/org/locationtech/jts/io/GeoJSONReader.js";
 import DistanceOp from "jsts/org/locationtech/jts/operation/distance/DistanceOp.js";
@@ -558,11 +558,115 @@ function mergeSourceGeometry(
   throw new UserFacingError(`暂不支持源图层几何类型 ${sourceLayerGeometryType} 的缓冲分析。`);
 }
 
+type SpatialRelationType = NonNullable<NonNullable<SpatialQueryDSL["spatialFilter"]>["relation"]>;
+
+function normalizeRelationType(
+  relation: SpatialRelationType | undefined
+): SpatialRelationType {
+  return relation ?? "intersects";
+}
+
+function relationToSpatialRel(relation: SpatialRelationType): string {
+  switch (relation) {
+    case "contains":
+      return "esriSpatialRelContains";
+    case "within":
+      return "esriSpatialRelWithin";
+    case "disjoint":
+      return "esriSpatialRelDisjoint";
+    case "touches":
+      return "esriSpatialRelTouches";
+    case "overlaps":
+      return "esriSpatialRelOverlaps";
+    case "intersects":
+    default:
+      return "esriSpatialRelIntersects";
+  }
+}
+
+function toEsriGeometryType(layerGeometryType: string): string {
+  if (/point/i.test(layerGeometryType)) {
+    return "esriGeometryPoint";
+  }
+  if (/polyline|line/i.test(layerGeometryType)) {
+    return "esriGeometryPolyline";
+  }
+  if (/polygon|area/i.test(layerGeometryType)) {
+    return "esriGeometryPolygon";
+  }
+  return layerGeometryType;
+}
+
+async function querySourceFeatures(
+  sourceLayer: LayerDescriptor,
+  sourceFilters: SpatialQueryDSL["attributeFilter"],
+  sourceFilterExpr: FilterExprNode | undefined,
+  options?: { limit?: number; allowEmptyFilter?: boolean; extraFields?: string[]; context?: string }
+): Promise<ArcgisFeatureLike[]> {
+  if (!options?.allowEmptyFilter && !sourceFilterExpr && sourceFilters.length === 0) {
+    throw new UserFacingError(`请先指定源图层“${sourceLayer.name}”中的目标要素条件。`, {
+      followUpQuestion: `请补充源要素条件后重试（当前源图层：${sourceLayer.name}）。`
+    });
+  }
+
+  const fields = Array.from(
+    new Set([sourceLayer.objectIdField, sourceLayer.displayField, ...(options?.extraFields ?? [])].filter(Boolean))
+  );
+
+  const sourceDsl: SpatialQueryDSL = {
+    intent: "search",
+    targetLayer: sourceLayer.layerKey,
+    attributeFilter: sourceFilters,
+    filterExpr: sourceFilterExpr,
+    aggregation: null,
+    limit: options?.limit ?? config.queryMaxFeatures,
+    output: {
+      fields,
+      returnGeometry: true
+    }
+  };
+
+  const sourcePlan = compileQueryPlan(sourceDsl);
+  const sourceExecution = await executePlanWithPagination(
+    sourcePlan,
+    sourceDsl.limit,
+    options?.context ?? "source-features"
+  );
+  const sourceFeatures = ((sourceExecution.payload.features as ArcgisFeatureLike[]) ?? []).filter((item) =>
+    Boolean(item.geometry)
+  );
+  return sourceFeatures;
+}
+
 function isSourceBufferMode(dsl: SpatialQueryDSL): boolean {
   return Boolean(
     dsl.spatialFilter?.type === "buffer" &&
       dsl.spatialFilter.sourceLayer &&
       (dsl.spatialFilter.sourceFilterExpr || dsl.spatialFilter.sourceAttributeFilter?.length)
+  );
+}
+
+function isSourceRelationMode(dsl: SpatialQueryDSL): boolean {
+  return Boolean(
+    dsl.spatialFilter?.type === "relation" &&
+      dsl.spatialFilter?.sourceLayer &&
+      (dsl.spatialFilter?.sourceFilterExpr || dsl.spatialFilter?.sourceAttributeFilter?.length)
+  );
+}
+
+function isSpatialJoinCountMode(dsl: SpatialQueryDSL): boolean {
+  return Boolean(
+    dsl.spatialFilter?.type === "relation" &&
+      dsl.spatialFilter?.joinMode === "count_by_source" &&
+      dsl.spatialFilter?.sourceLayer
+  );
+}
+
+function isMultiRingBufferMode(dsl: SpatialQueryDSL): boolean {
+  return Boolean(
+    dsl.spatialFilter?.type === "buffer" &&
+      Array.isArray(dsl.spatialFilter?.distances) &&
+      dsl.spatialFilter.distances.length > 1
   );
 }
 
@@ -690,6 +794,311 @@ async function executeSourceBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutio
     plan: targetPlan,
     payload: targetExecution.payload,
     executionMeta: targetExecution.executionMeta
+  };
+}
+
+async function executeSourceRelationDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResult> {
+  const sourceLayerKey = dsl.spatialFilter?.sourceLayer;
+  if (!sourceLayerKey) {
+    throw new UserFacingError("缺少源图层信息，无法执行空间关系查询。");
+  }
+  const sourceLayer = layerRegistry.getLayer(sourceLayerKey);
+  if (!sourceLayer || !sourceLayer.queryable) {
+    throw new UserFacingError(`源图层 ${sourceLayerKey} 不存在或不可查询。`);
+  }
+
+  const sourceFilters = dsl.spatialFilter?.sourceAttributeFilter ?? [];
+  const sourceFilterExpr = dsl.spatialFilter?.sourceFilterExpr;
+  const sourceFeatures = await querySourceFeatures(sourceLayer, sourceFilters, sourceFilterExpr, {
+    context: "source-relation-source"
+  });
+
+  if (sourceFeatures.length === 0) {
+    throw new UserFacingError(`未找到用于空间关系分析的源要素（图层：${sourceLayer.name}）。`, {
+      followUpQuestion: `请检查源要素条件后重试（当前源图层：${sourceLayer.name}）。`
+    });
+  }
+
+  const merged = mergeSourceGeometry(sourceLayer.geometryType, sourceFeatures);
+  const relation = normalizeRelationType(dsl.spatialFilter?.relation);
+  const targetDsl: SpatialQueryDSL = {
+    ...dsl,
+    spatialFilter: undefined
+  };
+  const targetPlan = compileQueryPlan(targetDsl);
+  targetPlan.geometry = merged.geometry;
+  targetPlan.geometryType = merged.geometryType;
+  targetPlan.spatialRel = relationToSpatialRel(relation);
+  targetPlan.distance = null;
+  targetPlan.units = null;
+  targetPlan.analysisType = "spatial_relation";
+  targetPlan.relationMeta = {
+    relation,
+    sourceLayer: sourceLayer.layerKey,
+    sourceCount: sourceFeatures.length
+  };
+
+  if (!shouldUsePagination(targetPlan)) {
+    try {
+      const payload = await executeArcgisQuery(targetPlan);
+      return {
+        plan: targetPlan,
+        payload,
+        executionMeta: {
+          truncated: false,
+          safetyCap: config.queryMaxFeatures,
+          fetched: Array.isArray(payload.features) ? payload.features.length : Number(payload.count ?? 0),
+          requestedLimit: dsl.limit
+        }
+      };
+    } catch (error) {
+      const message = (error as Error).message ?? "";
+      if (relation === "disjoint" && /Unsupported spatial relationship/i.test(message)) {
+        throw new UserFacingError("当前服务暂不支持“相离(disjoint)”空间关系查询。", {
+          followUpQuestion: "请改用相交/包含/被包含/接触/重叠等关系后重试。"
+        });
+      }
+      throw error;
+    }
+  }
+
+  try {
+    const targetExecution = await executePlanWithPagination(targetPlan, dsl.limit, "source-relation-target");
+    return {
+      plan: targetPlan,
+      payload: targetExecution.payload,
+      executionMeta: targetExecution.executionMeta
+    };
+  } catch (error) {
+    const message = (error as Error).message ?? "";
+    if (relation === "disjoint" && /Unsupported spatial relationship/i.test(message)) {
+      throw new UserFacingError("当前服务暂不支持“相离(disjoint)”空间关系查询。", {
+        followUpQuestion: "请改用相交/包含/被包含/接触/重叠等关系后重试。"
+      });
+    }
+    throw error;
+  }
+}
+
+async function executeSpatialJoinCountDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResult> {
+  const sourceLayerKey = dsl.spatialFilter?.sourceLayer;
+  if (!sourceLayerKey) {
+    throw new UserFacingError("缺少源图层信息，无法执行空间 Join 计数。");
+  }
+  const sourceLayer = layerRegistry.getLayer(sourceLayerKey);
+  if (!sourceLayer || !sourceLayer.queryable) {
+    throw new UserFacingError(`源图层 ${sourceLayerKey} 不存在或不可查询。`);
+  }
+
+  const sourceFilters = dsl.spatialFilter?.sourceAttributeFilter ?? [];
+  const sourceFilterExpr = dsl.spatialFilter?.sourceFilterExpr;
+  const sourceCap = Math.max(1, Math.min(200, dsl.limit || 200));
+  const sourceFeatures = await querySourceFeatures(sourceLayer, sourceFilters, sourceFilterExpr, {
+    limit: sourceCap,
+    allowEmptyFilter: true,
+    context: "spatial-join-source"
+  });
+
+  if (sourceFeatures.length === 0) {
+    throw new UserFacingError(`源图层 ${sourceLayer.name} 没有可用于统计的要素。`);
+  }
+
+  const relation = normalizeRelationType(dsl.spatialFilter?.relation ?? "within");
+  const targetDsl: SpatialQueryDSL = {
+    ...dsl,
+    intent: "count",
+    aggregation: { type: "count" },
+    spatialFilter: undefined,
+    sort: undefined,
+    orderBy: undefined,
+    output: {
+      ...dsl.output,
+      returnGeometry: false
+    }
+  };
+  const targetCountPlan = compileQueryPlan(targetDsl);
+  const results: ArcgisFeatureLike[] = [];
+
+  for (const sourceFeature of sourceFeatures) {
+    if (!sourceFeature.geometry) {
+      continue;
+    }
+    const countPlan: QueryPlan = {
+      ...targetCountPlan,
+      geometry: sourceFeature.geometry,
+      geometryType: toEsriGeometryType(sourceLayer.geometryType),
+      spatialRel: relationToSpatialRel(relation),
+      distance: null,
+      units: null
+    };
+    const payload = await executeArcgisQuery(countPlan);
+    const count = Number(payload.count ?? 0);
+    const sourceObjectId = sourceFeature.attributes?.[sourceLayer.objectIdField];
+    const sourceName = sourceFeatureName(sourceFeature, sourceLayer.displayField);
+    results.push({
+      geometry: sourceFeature.geometry,
+      attributes: {
+        _source_objectid: sourceObjectId ?? null,
+        _source_name: sourceName,
+        _join_count: Number.isFinite(count) ? count : 0
+      }
+    });
+  }
+
+  results.sort((a, b) => {
+    const aCount = Number(a.attributes?._join_count ?? 0);
+    const bCount = Number(b.attributes?._join_count ?? 0);
+    if (aCount !== bCount) {
+      return bCount - aCount;
+    }
+    const aId = String(a.attributes?._source_objectid ?? "");
+    const bId = String(b.attributes?._source_objectid ?? "");
+    return aId.localeCompare(bId);
+  });
+
+  const queryPlan: QueryPlan = {
+    ...targetCountPlan,
+    analysisType: "spatial_join_count",
+    relationMeta: {
+      relation,
+      sourceLayer: sourceLayer.layerKey,
+      sourceCount: sourceFeatures.length
+    },
+    joinMeta: {
+      relation,
+      sourceLayer: sourceLayer.layerKey,
+      sourceEvaluated: sourceFeatures.length,
+      sourceTruncated: dsl.limit > sourceCap
+    }
+  };
+
+  return {
+    plan: queryPlan,
+    payload: {
+      features: results,
+      joinStats: results.map((item) => item.attributes ?? {})
+    },
+    executionMeta: {
+      truncated: dsl.limit > sourceCap,
+      safetyCap: sourceCap,
+      fetched: results.length,
+      requestedLimit: dsl.limit
+    }
+  };
+}
+
+async function executeMultiRingBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResult> {
+  const radii = Array.from(
+    new Set(
+      (dsl.spatialFilter?.distances ?? [])
+        .map((item) => Math.round(item))
+        .filter((item) => Number.isFinite(item) && item > 0)
+    )
+  ).sort((a, b) => a - b);
+
+  if (radii.length < 2) {
+    throw new UserFacingError("多环缓冲至少需要两个半径值。");
+  }
+
+  let sourceGeometry: Record<string, unknown> | null = null;
+  let sourceGeometryType = "esriGeometryPoint";
+  let sourceMode: "center" | "source_layer" = "center";
+
+  if (dsl.spatialFilter?.center) {
+    sourceGeometry = {
+      x: dsl.spatialFilter.center.x,
+      y: dsl.spatialFilter.center.y,
+      spatialReference: dsl.spatialFilter.center.spatialReference ?? { wkid: 3857 }
+    };
+    sourceGeometryType = "esriGeometryPoint";
+  } else if (dsl.spatialFilter?.sourceLayer) {
+    const sourceLayer = layerRegistry.getLayer(dsl.spatialFilter.sourceLayer);
+    if (!sourceLayer || !sourceLayer.queryable) {
+      throw new UserFacingError(`源图层 ${dsl.spatialFilter.sourceLayer} 不存在或不可查询。`);
+    }
+    const sourceFilters = dsl.spatialFilter.sourceAttributeFilter ?? [];
+    const sourceFilterExpr = dsl.spatialFilter.sourceFilterExpr;
+    const sourceFeatures = await querySourceFeatures(sourceLayer, sourceFilters, sourceFilterExpr, {
+      context: "multi-ring-source"
+    });
+    if (sourceFeatures.length === 0) {
+      throw new UserFacingError(`未找到用于多环缓冲统计的源要素（图层：${sourceLayer.name}）。`);
+    }
+    const merged = mergeSourceGeometry(sourceLayer.geometryType, sourceFeatures);
+    sourceGeometry = merged.geometry;
+    sourceGeometryType = merged.geometryType;
+    sourceMode = "source_layer";
+  }
+
+  if (!sourceGeometry) {
+    throw new UserFacingError("多环缓冲统计缺少源位置。", {
+      followUpQuestion: "请提供坐标，或指定源要素条件后重试。"
+    });
+  }
+
+  const baseCountDsl: SpatialQueryDSL = {
+    ...dsl,
+    intent: "count",
+    aggregation: { type: "count" },
+    spatialFilter: undefined,
+    sort: undefined,
+    orderBy: undefined,
+    output: {
+      ...dsl.output,
+      returnGeometry: false
+    }
+  };
+  const basePlan = compileQueryPlan(baseCountDsl);
+  const ringOnly = dsl.spatialFilter?.ringOnly ?? true;
+  let previousCumulative = 0;
+  const ringStats: Array<Record<string, unknown>> = [];
+
+  for (const radius of radii) {
+    const countPlan: QueryPlan = {
+      ...basePlan,
+      geometry: sourceGeometry,
+      geometryType: sourceGeometryType,
+      spatialRel: "esriSpatialRelIntersects",
+      distance: radius,
+      units: "esriSRUnit_Meter"
+    };
+    const payload = await executeArcgisQuery(countPlan);
+    const cumulative = Number(payload.count ?? 0);
+    const ringCount = Math.max(0, cumulative - previousCumulative);
+    previousCumulative = cumulative;
+    ringStats.push({
+      radius_m: radius,
+      cumulative_count: cumulative,
+      ring_count: ringOnly ? ringCount : cumulative
+    });
+  }
+
+  const queryPlan: QueryPlan = {
+    ...basePlan,
+    geometry: sourceGeometry,
+    geometryType: sourceGeometryType,
+    spatialRel: "esriSpatialRelIntersects",
+    units: "esriSRUnit_Meter",
+    analysisType: "multi_ring_stat",
+    multiRingMeta: {
+      radiiMeters: radii,
+      ringOnly,
+      sourceMode
+    }
+  };
+
+  return {
+    plan: queryPlan,
+    payload: {
+      features: ringStats.map((attributes) => ({ attributes })),
+      multiRingStats: ringStats
+    },
+    executionMeta: {
+      truncated: false,
+      safetyCap: radii.length,
+      fetched: ringStats.length,
+      requestedLimit: radii.length
+    }
   };
 }
 
@@ -840,10 +1249,16 @@ async function executeNearestDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResu
 
   const topK = normalizeNearestLimit(dsl.limit);
   const requestedLimit = dsl.limit > config.nearestMaxK ? config.nearestMaxK : topK;
-  const initialRadius = Math.max(10, normalizePositiveInt(config.nearestInitialRadiusMeters, 500));
-  const maxRadius = Math.max(initialRadius, normalizePositiveInt(config.nearestMaxRadiusMeters, 100000));
+  const requestedWithin = dsl.spatialFilter?.radius;
+  const initialRadius = Math.max(
+    10,
+    normalizePositiveInt(Math.min(requestedWithin ?? config.nearestInitialRadiusMeters, config.nearestInitialRadiusMeters), 500)
+  );
+  const configuredMaxRadius = Math.max(initialRadius, normalizePositiveInt(config.nearestMaxRadiusMeters, 100000));
+  const maxRadius = requestedWithin ? Math.min(configuredMaxRadius, Math.max(initialRadius, Math.round(requestedWithin))) : configuredMaxRadius;
   const growthFactor = Math.max(1.1, Number(config.nearestRadiusGrowthFactor) || 2);
   const candidateCap = normalizePositiveInt(config.nearestCandidateCap, 50000);
+  const excludeSelf = dsl.spatialFilter?.excludeSelf !== false;
 
   const targetDsl: SpatialQueryDSL = {
     ...dsl,
@@ -876,6 +1291,9 @@ async function executeNearestDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResu
     const batch = ((paged.payload.features as ArcgisFeatureLike[]) ?? []).filter((item) => Boolean(item.geometry));
     const filtered = batch.filter((item) => {
       if (source.sourceMode !== "source_layer") {
+        return true;
+      }
+      if (!excludeSelf) {
         return true;
       }
       if (dsl.targetLayer !== source.sourceLayer) {
@@ -966,8 +1384,20 @@ async function executeNearestDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResu
 }
 
 export async function executeDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResult> {
+  if (isSpatialJoinCountMode(dsl)) {
+    return executeSpatialJoinCountDsl(dsl);
+  }
+
+  if (isMultiRingBufferMode(dsl)) {
+    return executeMultiRingBufferDsl(dsl);
+  }
+
   if (dsl.intent === "nearest") {
     return executeNearestDsl(dsl);
+  }
+
+  if (isSourceRelationMode(dsl)) {
+    return executeSourceRelationDsl(dsl);
   }
 
   if (isSourceBufferMode(dsl)) {

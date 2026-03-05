@@ -58,8 +58,11 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "去重查询使用 aggregation.type='distinct' + aggregation.groupBy=[字段]，并关闭 returnGeometry。",
     `search/buffer_search 的 limit 必须 <= ${maxLimit}；若用户未明确“前N”，默认设为 ${maxLimit}。`,
     `nearest 的 limit 必须 <= ${nearestMax}；若用户未明确“前N”，默认设为 ${nearestDefault}。`,
-    "buffer_search 需要 radius + unit(meter/kilometer)。",
+    "buffer_search 需要 radius + unit(meter/kilometer)；多环缓冲统计可使用 spatialFilter.distances=[500,1000,2000] + ringOnly=true。",
+    "空间关系查询使用 spatialFilter.type='relation' + relation(intersects|contains|within|disjoint|touches|overlaps) + sourceLayer/sourceFilter。",
+    "空间 Join 计数使用 spatialFilter.joinMode='count_by_source'（按每个源对象统计目标数量）。",
     "nearest 需要可解析的源要素：要么 spatialFilter.center（坐标），要么 sourceLayer+sourceAttributeFilter（单源）。",
+    "nearest 可选 spatialFilter.radius 作为最大检索半径，可选 excludeSelf 控制同层是否排除自身。",
     "nearest 默认 attributeFilter=[]；仅当目标部分有明确字段条件时才允许设置目标过滤。",
     "坐标类问句中的 x/y 是坐标参数，不是属性字段，禁止生成 field=x 或 field=y 过滤。",
     "字段名只能使用目标图层（或 sourceLayer）的可查询字段，不得自造字段。",
@@ -80,7 +83,10 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "例如“名称包含生态的有哪些”应提取 value='生态'；“名称含有湿地的公园列表”应提取 value='湿地'。",
     "连接词语义：且/并且/、/，/, => AND；或/或者 => OR；AND 优先于 OR。",
     "“附近/周边/X米内/X公里内” => intent=buffer_search。",
-    "“最近/最近的/nearest” => intent=nearest。"
+    "“最近/最近的/nearest” => intent=nearest。",
+    "“相交/包含/被包含/相离/接触/重叠” => spatialFilter.type=relation 并设置 relation。",
+    "“每个X内Y数量” => spatialFilter.joinMode='count_by_source'。",
+    "“500米、1公里、2公里内…数量” => spatialFilter.distances + ringOnly=true。"
   ].join("\n");
 
   const section5 = [
@@ -522,6 +528,119 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           aggregation: null,
           limit: 5,
           output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "标准名称为南二环的道路街巷相交的门牌号码"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.93,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: doorplateLayerKey,
+          spatialFilter: {
+            type: "relation",
+            relation: "intersects",
+            sourceLayer: roadLayerKey,
+            sourceAttributeFilter: [{ field: "标准名称", operator: "=", value: "南二环" }]
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "每个宗地院落内门牌号码数量前20个"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.9,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: doorplateLayerKey,
+          spatialFilter: {
+            type: "relation",
+            relation: "within",
+            joinMode: "count_by_source",
+            sourceLayer: parcelLayerKey,
+            sourceAttributeFilter: []
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: 20,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "x:13303000,y:2996000 1000米内最近的公园前5个"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.93,
+        followUpQuestion: null,
+        dsl: {
+          intent: "nearest",
+          targetLayer: defaultLayerKey,
+          spatialFilter: {
+            type: "nearest",
+            radius: 1000,
+            excludeSelf: true,
+            center: {
+              x: 13303000,
+              y: 2996000,
+              spatialReference: { wkid: 3857 }
+            }
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: 5,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "x:13303000,y:2996000 500米、1公里、2公里内公园数量对比"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.9,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: defaultLayerKey,
+          spatialFilter: {
+            type: "buffer",
+            distances: [500, 1000, 2000],
+            ringOnly: true,
+            center: {
+              x: 13303000,
+              y: 2996000,
+              spatialReference: { wkid: 3857 }
+            }
+          },
+          attributeFilter: [],
+          aggregation: null,
+          limit: 3,
+          output: { fields: [], returnGeometry: false }
         }
       })
     },

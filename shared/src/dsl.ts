@@ -72,10 +72,16 @@ export const filterExprNodeSchema: z.ZodType<FilterExprNode> = z.lazy(() =>
 
 export const spatialFilterSchema = z
   .object({
-    type: z.enum(["buffer", "intersects", "nearest"]).optional(),
+    type: z.enum(["buffer", "intersects", "nearest", "relation"]).optional(),
+    relation: z
+      .enum(["intersects", "contains", "within", "disjoint", "touches", "overlaps"])
+      .optional(),
+    joinMode: z.enum(["count_by_source"]).optional(),
     radius: z.number().positive().optional(),
+    distances: z.array(z.number().positive()).max(8).optional(),
     unit: z.enum(["meter", "kilometer"]).optional(),
     ringOnly: z.boolean().optional(),
+    excludeSelf: z.boolean().optional(),
     sourceLayer: z.string().min(1).optional(),
     sourceAttributeFilter: z.array(attributeFilterSchema).optional(),
     sourceFilterExpr: filterExprNodeSchema.optional(),
@@ -173,7 +179,7 @@ export interface QueryPlan {
   returnCountOnly?: boolean;
   groupByFieldsForStatistics?: string;
   outStatistics?: string;
-  analysisType?: "nearest";
+  analysisType?: "nearest" | "spatial_relation" | "spatial_join_count" | "multi_ring_stat";
   nearestMeta?: {
     topK: number;
     sourceMode: "center" | "source_layer";
@@ -181,6 +187,22 @@ export interface QueryPlan {
     sourceObjectId?: string;
     radiusUsedMeters: number;
     candidateCount: number;
+  };
+  relationMeta?: {
+    relation: "intersects" | "contains" | "within" | "disjoint" | "touches" | "overlaps";
+    sourceLayer: string;
+    sourceCount: number;
+  };
+  joinMeta?: {
+    relation: "intersects" | "contains" | "within" | "disjoint" | "touches" | "overlaps";
+    sourceLayer: string;
+    sourceEvaluated: number;
+    sourceTruncated: boolean;
+  };
+  multiRingMeta?: {
+    radiiMeters: number[];
+    ringOnly: boolean;
+    sourceMode: "center" | "source_layer";
   };
 }
 
