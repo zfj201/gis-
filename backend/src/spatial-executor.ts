@@ -45,6 +45,9 @@ function shouldUsePagination(plan: QueryPlan): boolean {
   if (plan.groupByFieldsForStatistics || plan.outStatistics) {
     return false;
   }
+  if (plan.returnDistinctValues) {
+    return false;
+  }
   return true;
 }
 

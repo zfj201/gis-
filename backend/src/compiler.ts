@@ -19,6 +19,16 @@ function normalizeLikeValue(value: string): string {
   return `%${trimmed}%`;
 }
 
+function splitListValues(rawValue: string): string[] {
+  return rawValue
+    .trim()
+    .replace(/^[（(]\s*/, "")
+    .replace(/\s*[）)]$/, "")
+    .split(/[，,、]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function isStringField(fieldType: string): boolean {
   return fieldType === "esriFieldTypeString";
 }
@@ -41,6 +51,27 @@ function parseNumericValue(fieldName: string, rawValue: string): number {
     });
   }
   return value;
+}
+
+function parseNumericRangeValue(fieldName: string, rawValue: string): [number, number] {
+  const compact = rawValue.replace(/\s+/g, "");
+  const pairs = compact.match(/-?\d+(?:\.\d+)?/g) ?? [];
+  const first = pairs[0];
+  const second = pairs[1];
+  if (first !== undefined && second !== undefined) {
+    const min = parseNumericValue(fieldName, first);
+    const max = parseNumericValue(fieldName, second);
+    return [Math.min(min, max), Math.max(min, max)];
+  }
+  const matched = compact.match(/(-?\d+(?:\.\d+)?).*(-?\d+(?:\.\d+)?)/);
+  if (matched?.[1] && matched[2]) {
+    const min = parseNumericValue(fieldName, matched[1]);
+    const max = parseNumericValue(fieldName, matched[2]);
+    return [Math.min(min, max), Math.max(min, max)];
+  }
+  throw new UserFacingError(`字段 ${fieldName} 的 between 条件需要两个数值边界。`, {
+    followUpQuestion: `请按“${fieldName} 在 20,100 之间”或“${fieldName} 介于20到100之间”重试。`
+  });
 }
 
 const MAX_FILTER_EXPR_DEPTH = 6;
@@ -70,10 +101,21 @@ function buildWhereConditionClause(
   condition: Extract<FilterExprNode, { kind: "condition" }>,
   fieldTypes: Map<string, string>
 ): string {
+  const rawValue = String(condition.value ?? "").trim();
   const fieldType = fieldTypes.get(condition.field);
   if (!fieldType) {
     throw new UserFacingError(`字段 ${condition.field} 不存在或不可查询。`, {
       followUpQuestion: `字段 ${condition.field} 不存在于目标图层，请改用图层真实字段后重试。`
+    });
+  }
+
+  if (condition.operator === "is null" || condition.operator === "is not null") {
+    return `${condition.field} ${condition.operator.toUpperCase()}`;
+  }
+
+  if (!rawValue) {
+    throw new UserFacingError(`字段 ${condition.field} 缺少条件值。`, {
+      followUpQuestion: `请补充字段 ${condition.field} 的条件值后重试。`
     });
   }
 
@@ -85,19 +127,39 @@ function buildWhereConditionClause(
     if (!isNumericField(fieldType)) {
       throw new UserFacingError(`字段 ${condition.field} 不是数值字段，不能使用 ${condition.operator}。`);
     }
-    const numericValue = parseNumericValue(condition.field, condition.value);
+    const numericValue = parseNumericValue(condition.field, rawValue);
     return `${condition.field} ${condition.operator} ${numericValue}`;
   }
 
-  if (condition.operator === "=") {
-    if (isNumericField(fieldType)) {
-      const numericValue = parseNumericValue(condition.field, condition.value);
-      return `${condition.field} = ${numericValue}`;
+  if (condition.operator === "between") {
+    if (!isNumericField(fieldType)) {
+      throw new UserFacingError(`字段 ${condition.field} 不是数值字段，不能使用 BETWEEN。`);
     }
-    return `${condition.field} = '${escapeSql(condition.value)}'`;
+    const [min, max] = parseNumericRangeValue(condition.field, rawValue);
+    return `${condition.field} BETWEEN ${min} AND ${max}`;
   }
 
-  return `${condition.field} LIKE '${escapeSql(normalizeLikeValue(condition.value))}'`;
+  if (condition.operator === "in" || condition.operator === "not in") {
+    const values = splitListValues(rawValue);
+    if (!values.length) {
+      throw new UserFacingError(`字段 ${condition.field} 的 ${condition.operator.toUpperCase()} 条件为空。`);
+    }
+    const sqlValues = isNumericField(fieldType)
+      ? values.map((item) => String(parseNumericValue(condition.field, item)))
+      : values.map((item) => `'${escapeSql(item)}'`);
+    return `${condition.field} ${condition.operator.toUpperCase()} (${sqlValues.join(", ")})`;
+  }
+
+  if (condition.operator === "=" || condition.operator === "!=") {
+    const sqlOperator = condition.operator === "!=" ? "<>" : "=";
+    if (isNumericField(fieldType)) {
+      const numericValue = parseNumericValue(condition.field, rawValue);
+      return `${condition.field} ${sqlOperator} ${numericValue}`;
+    }
+    return `${condition.field} ${sqlOperator} '${escapeSql(rawValue)}'`;
+  }
+
+  return `${condition.field} LIKE '${escapeSql(normalizeLikeValue(rawValue))}'`;
 }
 
 function buildWhereFromExpr(
@@ -141,7 +203,8 @@ function normalizeOutFields(
   dsl: SpatialQueryDSL,
   allowedFields: Set<string>,
   fallbackFields: string[],
-  objectIdField: string
+  objectIdField: string,
+  options?: { includeObjectId?: boolean }
 ): string {
   if (fallbackFields.length === 0) {
     throw new UserFacingError("目标图层缺少可输出字段，无法执行查询。");
@@ -149,7 +212,7 @@ function normalizeOutFields(
 
   const appendObjectIdField = (fields: string[]): string[] => {
     const deduped = Array.from(new Set(fields));
-    if (allowedFields.has(objectIdField) && !deduped.includes(objectIdField)) {
+    if (options?.includeObjectId !== false && allowedFields.has(objectIdField) && !deduped.includes(objectIdField)) {
       deduped.push(objectIdField);
     }
     return deduped;
@@ -182,7 +245,28 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
   const fieldTypeMap = new Map(queryableFields.map((field) => [field.name, field.type]));
   const fallbackFields = defaultOutputFields(layer);
   const where = buildWhere(dsl, fieldTypeMap);
-  const outFields = normalizeOutFields(dsl, allowedFieldSet, fallbackFields, layer.objectIdField);
+  const isDistinct = dsl.aggregation?.type === "distinct";
+  const distinctField = dsl.aggregation?.groupBy?.[0];
+  if (isDistinct && (!distinctField || !allowedFieldSet.has(distinctField))) {
+    throw new UserFacingError("去重查询缺少有效字段。", {
+      followUpQuestion: "请明确要去重的字段，例如“列出区县去重值”。"
+    });
+  }
+  const outFields = isDistinct && distinctField
+    ? normalizeOutFields(
+      {
+        ...dsl,
+        output: {
+          ...dsl.output,
+          fields: [distinctField]
+        }
+      },
+      allowedFieldSet,
+      fallbackFields,
+      layer.objectIdField,
+      { includeObjectId: false }
+    )
+    : normalizeOutFields(dsl, allowedFieldSet, fallbackFields, layer.objectIdField);
 
   const plan: QueryPlan = {
     layer: layer.url,
@@ -196,11 +280,18 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
     returnGeometry: dsl.output.returnGeometry
   };
 
-  if (dsl.sort?.by) {
-    if (!allowedFieldSet.has(dsl.sort.by)) {
-      throw new UserFacingError(`排序字段 ${dsl.sort.by} 不存在于目标图层。`);
+  const orderByItems =
+    dsl.orderBy?.map((item) => ({ field: item.field, direction: item.direction })) ??
+    (dsl.sort?.by ? [{ field: dsl.sort.by, direction: dsl.sort.order }] : []);
+  if (orderByItems.length > 0) {
+    const clauses: string[] = [];
+    for (const item of orderByItems) {
+      if (!allowedFieldSet.has(item.field)) {
+        throw new UserFacingError(`排序字段 ${item.field} 不存在于目标图层。`);
+      }
+      clauses.push(`${item.field} ${item.direction}`);
     }
-    plan.orderByFields = `${dsl.sort.by} ${dsl.sort.order}`;
+    plan.orderByFields = clauses.join(", ");
   }
 
   if (dsl.intent === "count" || dsl.aggregation?.type === "count") {
@@ -223,6 +314,14 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
         outStatisticFieldName: "park_count"
       }
     ]);
+  }
+
+  if (isDistinct && distinctField) {
+    plan.returnGeometry = false;
+    plan.returnDistinctValues = true;
+    if (!plan.orderByFields) {
+      plan.orderByFields = `${distinctField} asc`;
+    }
   }
 
   if (dsl.spatialFilter?.type === "buffer") {

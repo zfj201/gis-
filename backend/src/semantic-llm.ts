@@ -190,7 +190,7 @@ function isUnconstrainedSearch(dsl: SpatialQueryDSL): boolean {
   const noSpatial = !dsl.spatialFilter || !dsl.spatialFilter.type;
   const noAttribute = (!dsl.attributeFilter || dsl.attributeFilter.length === 0) && !dsl.filterExpr;
   const noAggregation = !dsl.aggregation;
-  const noSort = !dsl.sort;
+  const noSort = !dsl.sort && (!dsl.orderBy || dsl.orderBy.length === 0);
   return dsl.intent === "search" && noSpatial && noAttribute && noAggregation && noSort;
 }
 
@@ -334,6 +334,24 @@ function normalizeUnit(raw: unknown): "meter" | "kilometer" | undefined {
 
 function normalizeOperator(raw: unknown): SpatialQueryDSL["attributeFilter"][number]["operator"] {
   const value = String(raw ?? "").trim().toLowerCase();
+  if (["!=", "<>", "ne", "not_equal", "notequal", "not equals"].includes(value)) {
+    return "!=";
+  }
+  if (["in", "within_list"].includes(value)) {
+    return "in";
+  }
+  if (["not in", "not_in", "nin"].includes(value)) {
+    return "not in";
+  }
+  if (["between", "range"].includes(value)) {
+    return "between";
+  }
+  if (["is null", "null", "isnull"].includes(value)) {
+    return "is null";
+  }
+  if (["is not null", "not null", "isnotnull"].includes(value)) {
+    return "is not null";
+  }
   if (["gte", ">=", "atleast", "min"].includes(value)) {
     return ">=";
   }
@@ -352,6 +370,33 @@ function normalizeOperator(raw: unknown): SpatialQueryDSL["attributeFilter"][num
   return "=";
 }
 
+function operatorNeedsValue(operator: SpatialQueryDSL["attributeFilter"][number]["operator"]): boolean {
+  return operator !== "is null" && operator !== "is not null";
+}
+
+function normalizeOrderBy(raw: unknown): SpatialQueryDSL["orderBy"] {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const items = raw
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const field = String((item as { field?: unknown }).field ?? "").trim();
+      const rawDirection = String((item as { direction?: unknown }).direction ?? "").trim().toLowerCase();
+      if (!field) {
+        return null;
+      }
+      return {
+        field,
+        direction: rawDirection === "desc" ? "desc" : "asc"
+      } as const;
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+  return items.length > 0 ? items : undefined;
+}
+
 function normalizeFilterList(
   raw: unknown
 ): Array<{ field: string; operator: SpatialQueryDSL["attributeFilter"][number]["operator"]; value: string }> {
@@ -364,13 +409,17 @@ function normalizeFilterList(
         return null;
       }
       const field = String((item as { field?: unknown }).field ?? "").trim();
+      const operator = normalizeOperator((item as { operator?: unknown }).operator);
       const value = String((item as { value?: unknown }).value ?? "").trim();
-      if (!field || !value) {
+      if (!field) {
+        return null;
+      }
+      if (operatorNeedsValue(operator) && !value) {
         return null;
       }
       return {
         field,
-        operator: normalizeOperator((item as { operator?: unknown }).operator),
+        operator,
         value
       };
     })
@@ -396,14 +445,18 @@ function normalizeFilterExpr(raw: unknown): FilterExprNode | undefined {
   }
   if (kind === "condition") {
     const field = String(node.field ?? "").trim();
+    const operator = normalizeOperator(node.operator);
     const value = String(node.value ?? "").trim();
-    if (!field || !value) {
+    if (!field) {
+      return undefined;
+    }
+    if (operatorNeedsValue(operator) && !value) {
       return undefined;
     }
     return {
       kind: "condition",
       field,
-      operator: normalizeOperator(node.operator),
+      operator,
       value
     };
   }
@@ -453,6 +506,7 @@ function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
       dsl.aggregation && typeof dsl.aggregation === "object"
         ? (dsl.aggregation as SpatialQueryDSL["aggregation"])
         : null,
+    orderBy: normalizeOrderBy(dsl.orderBy),
     limit: normalizeLimit(dsl.limit),
     output: {
       fields: Array.isArray(output?.fields)
@@ -461,6 +515,17 @@ function normalizeDslForSchema(rawDsl: unknown): SpatialQueryDSL {
       returnGeometry: output?.returnGeometry === undefined ? true : Boolean(output.returnGeometry)
     }
   };
+
+  if (!normalized.orderBy && dsl.sort && typeof dsl.sort === "object") {
+    const by = String((dsl.sort as { by?: unknown }).by ?? "").trim();
+    const orderRaw = String((dsl.sort as { order?: unknown }).order ?? "").trim().toLowerCase();
+    if (by) {
+      normalized.orderBy = [{
+        field: by,
+        direction: orderRaw === "desc" ? "desc" : "asc"
+      }];
+    }
+  }
 
   if (locationEntity && typeof locationEntity === "object") {
     normalized.locationEntity = {
@@ -547,6 +612,10 @@ function applyLayerRouting(question: string, dsl: SpatialQueryDSL): ParseRespons
         type: "group_count",
         groupBy: [groupField]
       };
+      fixedDsl.orderBy = [{
+        field: groupField,
+        direction: "asc"
+      }];
       fixedDsl.sort = {
         by: groupField,
         order: "asc"
@@ -697,6 +766,10 @@ function normalizeModelOutput(
             type: "group_count",
             groupBy: [countyField]
           },
+          orderBy: [{
+            field: countyField,
+            direction: "asc"
+          }],
           sort: {
             by: countyField,
             order: "asc"
@@ -1085,7 +1158,11 @@ async function requestSemanticCompletion(
     } catch (error) {
       lastError = error;
       const message = (error as Error)?.message ?? "";
-      const shouldRetry = attempt < maxAttempts && /aborted|timeout|429|402|5\d\d|rate limit/i.test(message);
+      const hasFastFailHttpCode = /\b(401|403|429)\b/.test(message);
+      const shouldRetry =
+        attempt < maxAttempts &&
+        !hasFastFailHttpCode &&
+        /aborted|timeout|402|5\d\d|rate limit/i.test(message);
       const retryDelayMs = shouldRetry ? calcRetryDelayMs(message, attempt) : 0;
       console.warn("[semantic] provider attempt failed", {
         provider: provider.providerName,

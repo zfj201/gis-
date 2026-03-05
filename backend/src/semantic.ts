@@ -224,6 +224,24 @@ function parseOperatorByToken(token: string): SpatialQueryDSL["attributeFilter"]
   if (!value) {
     return "=";
   }
+  if (/(不为空|非空|is\s*not\s*null)/i.test(value)) {
+    return "is not null";
+  }
+  if (/(为空|是空|is\s*null|null)/i.test(value)) {
+    return "is null";
+  }
+  if (/(不等于|不为|不是|!=|<>)/i.test(value)) {
+    return "!=";
+  }
+  if (/(not\s*in|不在|不属于)/i.test(value)) {
+    return "not in";
+  }
+  if (/(between|介于|之间)/i.test(value)) {
+    return "between";
+  }
+  if (/(?:\bin\b|属于)/i.test(value)) {
+    return "in";
+  }
   if (/(大于等于|不少于|至少|>=)/i.test(value)) {
     return ">=";
   }
@@ -257,9 +275,49 @@ function extractExplicitFieldCondition(
       continue;
     }
     const escaped = fieldToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const betweenMatch = question.match(
+      new RegExp(`${escaped}\\s*(?:的)?\\s*(?:介于|between|在)?\\s*(-?\\d+(?:\\.\\d+)?)\\s*(?:到|至|~|-)\\s*(-?\\d+(?:\\.\\d+)?)(?:\\s*之间)?`, "i")
+    );
+    if (betweenMatch?.[1] && betweenMatch[2]) {
+      return {
+        field,
+        value: `${betweenMatch[1]},${betweenMatch[2]}`,
+        operator: "between"
+      };
+    }
+    const nullMatch = question.match(
+      new RegExp(`${escaped}\\s*(?:的)?\\s*(不为空|非空|is\\s*not\\s*null|为空|是空|is\\s*null)`, "i")
+    );
+    if (nullMatch?.[1]) {
+      return {
+        field,
+        value: "",
+        operator: parseOperatorByToken(nullMatch[1])
+      };
+    }
+    const notInMatch = question.match(
+      new RegExp(`${escaped}\\s*(?:的)?\\s*(?:不在|不属于|not\\s*in)\\s*[（(]?([^）)]+)[）)]?`, "i")
+    );
+    if (notInMatch?.[1]) {
+      return {
+        field,
+        value: notInMatch[1].trim(),
+        operator: "not in"
+      };
+    }
+    const inMatch = question.match(
+      new RegExp(`${escaped}\\s*(?:的)?\\s*(?:\\bin\\b|属于)\\s*[（(]?([^）)]+)[）)]?`, "i")
+    );
+    if (inMatch?.[1]) {
+      return {
+        field,
+        value: inMatch[1].trim(),
+        operator: "in"
+      };
+    }
     const match = question.match(
       new RegExp(
-        `${escaped}\\s*(?:的)?\\s*(小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)\\s*[“"']?([^，。！？!?]+)`,
+        `${escaped}\\s*(?:的)?\\s*(不等于|不为|不是|!=|<>|小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)\\s*[“"']?([^，。！？!?]+)`,
         "i"
       )
     );
@@ -291,40 +349,157 @@ interface ConditionExprParseResult {
   warnings: string[];
 }
 
-function connectorToLogic(connector: string): LogicConnector {
-  if (/(或|或者)/.test(connector)) {
-    return "or";
-  }
-  return "and";
-}
-
 function hasConditionSignal(text: string): boolean {
-  return /(小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)/i.test(
+  return /(不等于|不为|不是|!=|<>|不在|不属于|in|not in|between|介于|之间|为空|非空|is null|is not null|小于等于|不超过|至多|大于等于|不少于|至少|小于|低于|少于|以下|大于|高于|多于|以上|超过|为|等于|就是|是|包含|含有|相关|类似|>=|<=|>|<|:|：)/i.test(
     text
   );
 }
 
+function resolveFieldFromQuestionToken(question: string, layer: LayerDescriptor): string | null {
+  const fieldLookup = buildFieldLookup(layer.fields.map((field) => field.name));
+  const candidates = [
+    ...layer.fields.map((field) => field.name),
+    ...layer.fields.map((field) => field.alias),
+    "面积",
+    "长度",
+    "周长",
+    "对象id",
+    "objectid",
+    "编号"
+  ]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  for (const token of candidates) {
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(escaped, "i").test(question)) {
+      const mapped = fieldLookup.get(token.toLowerCase());
+      if (mapped) {
+        return mapped;
+      }
+    }
+  }
+  return null;
+}
+
+function parseSortOrder(question: string, layer: LayerDescriptor): SpatialQueryDSL["orderBy"] | undefined {
+  const toDirection = (raw: string): "asc" | "desc" => {
+    if (/(降序|从大到小|从高到低|倒序|desc)/i.test(raw)) {
+      return "desc";
+    }
+    return "asc";
+  };
+
+  const byMatch = question.match(/按\s*([^，。,]+)/);
+  if (!byMatch?.[1]) {
+    return undefined;
+  }
+  const field = resolveFieldFromQuestionToken(byMatch[1], layer) ?? resolveFieldFromQuestionToken(question, layer);
+  if (!field) {
+    return undefined;
+  }
+  const direction = toDirection(question);
+  return [{ field, direction }];
+}
+
+function shouldUseDistinct(question: string, intent: SpatialQueryDSL["intent"]): boolean {
+  if (intent === "count" || intent === "group_stat" || intent === "nearest" || intent === "buffer_search") {
+    return false;
+  }
+  if (/(去重|不重复|唯一值|distinct)/i.test(question)) {
+    return true;
+  }
+  return /(?:有哪些|有什么|列出|查看|显示).*(区县|行政区划|县级政区).*(取值|值)?/.test(question);
+}
+
+function pickDistinctField(question: string, layer: LayerDescriptor): string | null {
+  const countyField = findCountyField(layer);
+  if (countyField && /(区县|行政区划|县级政区|行政区)/.test(question)) {
+    return countyField;
+  }
+  const hinted = resolveFieldFromQuestionToken(question, layer);
+  if (hinted) {
+    return hinted;
+  }
+  const displayField = layer.fields.find((field) => field.name === layer.displayField && field.queryable)?.name;
+  if (displayField) {
+    return displayField;
+  }
+  const firstString = layer.fields.find((field) => field.queryable && /String/i.test(field.type))?.name;
+  if (firstString) {
+    return firstString;
+  }
+  return layer.fields.find((field) => field.queryable)?.name ?? null;
+}
+
 function splitLogicalSegments(text: string): { segments: string[]; connectors: LogicConnector[] } {
-  const tokens = text
-    .split(/(并且|或者|且|或|、|，|,|和|并)/)
-    .map((item) => item.trim())
-    .filter(Boolean);
   const segments: string[] = [];
   const connectors: LogicConnector[] = [];
   let pendingConnector: LogicConnector | null = null;
+  let buffer = "";
+  let depth = 0;
 
-  for (const token of tokens) {
-    if (/^(并且|或者|且|或|、|，|,|和|并)$/.test(token)) {
-      pendingConnector = connectorToLogic(token);
-      continue;
+  const flushBuffer = (): void => {
+    const token = buffer.trim();
+    if (!token) {
+      buffer = "";
+      return;
     }
-
     if (segments.length > 0) {
       connectors.push(pendingConnector ?? "and");
     }
-    pendingConnector = null;
     segments.push(token);
+    pendingConnector = null;
+    buffer = "";
+  };
+
+  const singleConnectorMap = new Map<string, LogicConnector>([
+    ["且", "and"],
+    ["或", "or"],
+    ["、", "and"],
+    ["，", "and"],
+    [",", "and"],
+    ["和", "and"],
+    ["并", "and"]
+  ]);
+  const multiConnectors: Array<{ token: string; logic: LogicConnector }> = [
+    { token: "并且", logic: "and" },
+    { token: "或者", logic: "or" }
+  ];
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "(" || char === "（") {
+      depth += 1;
+      buffer += char;
+      continue;
+    }
+    if (char === ")" || char === "）") {
+      depth = Math.max(0, depth - 1);
+      buffer += char;
+      continue;
+    }
+
+    if (depth === 0) {
+      const matchedMulti = multiConnectors.find((item) => text.startsWith(item.token, index));
+      if (matchedMulti) {
+        flushBuffer();
+        pendingConnector = matchedMulti.logic;
+        index += matchedMulti.token.length - 1;
+        continue;
+      }
+
+      const singleLogic = singleConnectorMap.get(char);
+      if (singleLogic) {
+        flushBuffer();
+        pendingConnector = singleLogic;
+        continue;
+      }
+    }
+
+    buffer += char;
   }
+
+  flushBuffer();
 
   return {
     segments,
@@ -885,6 +1060,14 @@ export function parseQuestion(question: string): ParseResponse {
 
   dsl.intent = intent;
   dsl.limit = limit;
+  const parsedOrderBy = parseSortOrder(normalized, fallbackLayer);
+  if (parsedOrderBy?.length) {
+    dsl.orderBy = parsedOrderBy;
+    dsl.sort = {
+      by: parsedOrderBy[0].field,
+      order: parsedOrderBy[0].direction
+    };
+  }
 
   let followUpQuestion: string | null = target.followUpQuestion;
   const semanticWarnings: string[] = [];
@@ -929,6 +1112,25 @@ export function parseQuestion(question: string): ParseResponse {
       dsl.aggregation = { type: "group_count", groupBy: [countyField] };
       dsl.output.returnGeometry = false;
       dsl.sort = { by: countyField, order: "asc" };
+    }
+  }
+
+  if (shouldUseDistinct(normalized, intent)) {
+    const distinctField = pickDistinctField(normalized, fallbackLayer);
+    if (distinctField) {
+      dsl.aggregation = {
+        type: "distinct",
+        groupBy: [distinctField]
+      };
+      dsl.output.fields = [distinctField];
+      dsl.output.returnGeometry = false;
+      if (!dsl.orderBy?.length) {
+        dsl.orderBy = [{ field: distinctField, direction: "asc" }];
+        dsl.sort = { by: distinctField, order: "asc" };
+      }
+      if (followUpQuestion && /请先指定目标图层/.test(followUpQuestion)) {
+        followUpQuestion = null;
+      }
     }
   }
 

@@ -64,6 +64,22 @@ export function summarizeResult(
     return `按${groupField}统计：${parts.join("，")}。`;
   }
 
+  if (dsl.aggregation?.type === "distinct") {
+    const distinctField = dsl.aggregation.groupBy?.[0] ?? "字段";
+    const features = (payload.features as Array<{ attributes?: Record<string, unknown> }>) ?? [];
+    if (features.length === 0) {
+      return `未检索到${layerName}的${distinctField}去重值。`;
+    }
+    const values = features
+      .map((item) => item.attributes?.[distinctField])
+      .filter((item) => item !== undefined && item !== null)
+      .map((item) => String(item).trim())
+      .filter(Boolean);
+    const uniqueValues = Array.from(new Set(values));
+    const preview = uniqueValues.slice(0, 6);
+    return `共检索到 ${uniqueValues.length} 个${distinctField}去重值，示例：${preview.join("、")}。`;
+  }
+
   if (dsl.intent === "nearest") {
     const features = (payload.features as Array<{ attributes?: Record<string, unknown> }>) ?? [];
     if (features.length === 0) {

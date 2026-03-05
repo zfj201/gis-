@@ -51,9 +51,11 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
   const section3 = [
     "【第3段：DSL 语义约束】",
     "dsl.intent 仅允许：search | count | group_stat | nearest | buffer_search。",
-    "attributeFilter.operator 仅允许：= | like | > | >= | < | <=。",
+    "attributeFilter.operator 仅允许：= | != | like | > | >= | < | <= | in | not in | between | is null | is not null。",
     "支持 filterExpr 逻辑表达式树：condition/group，group.logic 仅 and/or，children 至少1个。",
     "当问句包含多个条件（且/并且/、/，/,/或/或者），优先输出 filterExpr；不要丢失 OR 语义。",
+    "排序可使用 orderBy: [{field,direction}]，direction 仅 asc/desc。",
+    "去重查询使用 aggregation.type='distinct' + aggregation.groupBy=[字段]，并关闭 returnGeometry。",
     `search/buffer_search 的 limit 必须 <= ${maxLimit}；若用户未明确“前N”，默认设为 ${maxLimit}。`,
     `nearest 的 limit 必须 <= ${nearestMax}；若用户未明确“前N”，默认设为 ${nearestDefault}。`,
     "buffer_search 需要 radius + unit(meter/kilometer)。",
@@ -69,6 +71,10 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     "【第4段：意图映射规则】",
     "“多少/几个/总数/数量” => intent=count 且 aggregation.type=count。",
     "“为/等于/就是/是/：” => 精确匹配 operator='='。",
+    "“不等于/不为/不是” => operator='!='。",
+    "“在(1,2,3)/属于” => operator='in'；“不在/不属于” => operator='not in'。",
+    "“介于A到B之间” => operator='between'。",
+    "“为空/非空” => operator='is null' / 'is not null'。",
     "“包含/含有/相关/类似” => 模糊匹配 operator='like'，并使用 %value%。",
     "当句子包含“有哪些/列表/清单/名录”等问句尾词时，这些词不是检索关键词，必须从 value 中剔除。",
     "例如“名称包含生态的有哪些”应提取 value='生态'；“名称含有湿地的公园列表”应提取 value='湿地'。",
@@ -156,6 +162,68 @@ export function buildSemanticFewShots(defaultLayerKey: string, layers: LayerDesc
           aggregation: { type: "count" },
           limit: maxLimit,
           output: { fields: [], returnGeometry: false }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "按面积降序前10个宗地院落"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: parcelLayerKey,
+          attributeFilter: [],
+          aggregation: null,
+          orderBy: [{ field: "SHAPE__Area", direction: "desc" }],
+          limit: 10,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "objectid in (45854,45855) 的宗地院落"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: parcelLayerKey,
+          attributeFilter: [{ field: "objectid", operator: "in", value: "45854,45855" }],
+          aggregation: null,
+          limit: maxLimit,
+          output: { fields: [], returnGeometry: true }
+        }
+      })
+    },
+    {
+      role: "user",
+      content: "列出区县去重值"
+    },
+    {
+      role: "assistant",
+      content: JSON.stringify({
+        actionable: true,
+        confidence: 0.94,
+        followUpQuestion: null,
+        dsl: {
+          intent: "search",
+          targetLayer: defaultLayerKey,
+          attributeFilter: [],
+          aggregation: { type: "distinct", groupBy: ["区县"] },
+          orderBy: [{ field: "区县", direction: "asc" }],
+          limit: maxLimit,
+          output: { fields: ["区县"], returnGeometry: false }
         }
       })
     },

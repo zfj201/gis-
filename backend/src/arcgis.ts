@@ -32,6 +32,10 @@ export async function executeArcgisQuery(plan: QueryPlan): Promise<Record<string
     params.set("returnCountOnly", "true");
   }
 
+  if (plan.returnDistinctValues) {
+    params.set("returnDistinctValues", "true");
+  }
+
   if (plan.groupByFieldsForStatistics && plan.outStatistics) {
     params.set("groupByFieldsForStatistics", plan.groupByFieldsForStatistics);
     params.set("outStatistics", plan.outStatistics);

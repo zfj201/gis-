@@ -30,9 +30,14 @@ const spatialActionSignals: Array<{ pattern: RegExp; score: number; reason: stri
     reason: "距离单位命中"
   },
   {
-    pattern: /(查询|检索|查找|统计|分组|汇总|多少|几个|数量|总数)/i,
+    pattern: /(查询|检索|查找|筛选|列出|显示|统计|分组|汇总|多少|几个|数量|总数)/i,
     score: 1.2,
     reason: "空间查询动作词命中"
+  },
+  {
+    pattern: /(去重|不重复|唯一值|distinct|升序|降序|排序|between|not\s*in|\bin\s*\(|不在|介于|为空|非空)/i,
+    score: 1.8,
+    reason: "属性分析词命中"
   },
   {
     pattern: /(公园|道路|街巷|门牌|地址|宗地|院落|地块|房屋|建筑|单元楼|图层|要素)/i,

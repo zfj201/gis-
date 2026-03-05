@@ -88,11 +88,17 @@ const DEFAULT_SYNONYMS: SemanticSynonyms = {
   },
   operator: {
     "=": ["为", "等于", "是", "就是", ":", "："],
+    "!=": ["不等于", "不为", "不是", "!="],
     like: ["包含", "含有", "相关", "类似"],
     "<": ["小于", "低于", "少于", "以下"],
     "<=": ["不超过", "至多", "小于等于"],
     ">": ["大于", "高于", "多于", "以上", "超过"],
-    ">=": ["不少于", "至少", "大于等于"]
+    ">=": ["不少于", "至少", "大于等于"],
+    in: ["在", "属于", "in"],
+    "not in": ["不在", "不属于", "not in"],
+    between: ["介于", "之间", "between"],
+    "is null": ["为空", "是空", "null"],
+    "is not null": ["不为空", "非空", "not null"]
   }
 };
 
@@ -620,4 +626,3 @@ export async function appendSemanticFailureRecord(input: SemanticFailureRecordIn
     console.warn("[semantic-rag] 记录失败样本失败:", (error as Error).message);
   }
 }
-

@@ -18,24 +18,30 @@ export const locationTypeSchema = z.enum([
 
 export const operatorSchema = z.enum([
   "=",
+  "!=",
   "like",
   ">",
   ">=",
   "<",
-  "<="
+  "<=",
+  "in",
+  "not in",
+  "between",
+  "is null",
+  "is not null"
 ]);
 
 export const attributeFilterSchema = z.object({
   field: z.string().min(1),
   operator: operatorSchema,
-  value: z.string().min(1)
+  value: z.string().default("")
 });
 
 export type FilterConditionNode = {
   kind: "condition";
   field: string;
   operator: z.infer<typeof operatorSchema>;
-  value: string;
+  value?: string;
 };
 
 export type FilterGroupNode = {
@@ -50,7 +56,7 @@ export const filterConditionNodeSchema = z.object({
   kind: z.literal("condition"),
   field: z.string().min(1),
   operator: operatorSchema,
-  value: z.string().min(1)
+  value: z.string().optional()
 });
 
 export const filterExprNodeSchema: z.ZodType<FilterExprNode> = z.lazy(() =>
@@ -103,10 +109,19 @@ export const spatialQueryDslSchema = z.object({
   filterExpr: filterExprNodeSchema.optional(),
   aggregation: z
     .object({
-      type: z.enum(["count", "group_count"]).optional(),
+      type: z.enum(["count", "group_count", "distinct"]).optional(),
       groupBy: z.array(z.string()).optional()
     })
     .nullable()
+    .optional(),
+  orderBy: z
+    .array(
+      z.object({
+        field: z.string().min(1),
+        direction: z.enum(["asc", "desc"])
+      })
+    )
+    .min(1)
     .optional(),
   sort: z
     .object({
@@ -152,6 +167,7 @@ export interface QueryPlan {
   outFields: string;
   returnGeometry: boolean;
   orderByFields?: string;
+  returnDistinctValues?: boolean;
   resultRecordCount?: number;
   resultOffset?: number;
   returnCountOnly?: boolean;

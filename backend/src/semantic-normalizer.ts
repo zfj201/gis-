@@ -30,7 +30,8 @@ const valueNoiseSuffixPatterns = [
   /有什么$/,
   /列表$/,
   /清单$/,
-  /名录$/
+  /名录$/,
+  /前[0-9一二三四五六七八九十百千万两]+(?:个|条|项)?$/
 ];
 
 function escapeRegex(value: string): string {
@@ -48,6 +49,7 @@ function cleanValue(value: string): string {
     .replace(questionTailPattern, "")
     .replace(punctuationEndPattern, "")
     .trim();
+  next = next.replace(/前[0-9一二三四五六七八九十百千万两]+(?:个|条|项)?$/g, "").trim();
   next = next.replace(/^的+/, "").trim();
   let changed = true;
   while (changed) {
@@ -98,6 +100,24 @@ function parseOperatorToken(rawOperator: string): FilterOperator {
   if (!value) {
     return "=";
   }
+  if (/(不为空|非空|is\s*not\s*null)/i.test(value)) {
+    return "is not null";
+  }
+  if (/(为空|是空|is\s*null|null)/i.test(value)) {
+    return "is null";
+  }
+  if (/(不等于|不为|不是|!=|<>)/i.test(value)) {
+    return "!=";
+  }
+  if (/(not\s*in|不在|不属于)/i.test(value)) {
+    return "not in";
+  }
+  if (/(between|介于|之间)/i.test(value)) {
+    return "between";
+  }
+  if (/(?:\bin\b|属于)/i.test(value)) {
+    return "in";
+  }
 
   if (greaterThanEqualPattern.test(value) || value === ">=") {
     return ">=";
@@ -143,6 +163,22 @@ function extractFieldCondition(
   ].sort((a, b) => b.length - a.length);
 
   const operatorAlternatives = [
+    "不为空",
+    "非空",
+    "is not null",
+    "为空",
+    "是空",
+    "is null",
+    "不等于",
+    "不为",
+    "不是",
+    "!=",
+    "<>",
+    "not in",
+    "不在",
+    "不属于",
+    "between",
+    "介于",
     "小于等于",
     "不超过",
     "至多",
@@ -176,6 +212,23 @@ function extractFieldCondition(
 
   for (const fieldToken of lexicalFields) {
     const escapedField = escapeRegex(fieldToken);
+    const nullPattern = new RegExp(
+      `${escapedField}\\s*(?:的)?\\s*(不为空|非空|is\\s*not\\s*null|为空|是空|is\\s*null)`,
+      "i"
+    );
+    const nullMatch = question.match(nullPattern);
+    if (nullMatch?.[1]) {
+      const field = resolveFieldName(fieldToken, layer);
+      if (!field) {
+        continue;
+      }
+      return {
+        field,
+        operator: parseOperatorToken(nullMatch[1]),
+        value: ""
+      };
+    }
+
     const operatorPart = operatorAlternatives.map((item) => escapeRegex(item)).join("|");
     const explicitPattern = new RegExp(
       `${escapedField}\\s*(?:的)?\\s*(${operatorPart})\\s*[“"']?([^，。！？!?]+)`,
@@ -238,7 +291,7 @@ function flattenExprToAndFilters(expr: FilterExprNode | undefined): SpatialQuery
     return [{
       field: expr.field,
       operator: expr.operator,
-      value: expr.value
+      value: String(expr.value ?? "")
     }];
   }
   if (expr.logic !== "and") {
@@ -252,7 +305,7 @@ function flattenExprToAndFilters(expr: FilterExprNode | undefined): SpatialQuery
     values.push({
       field: child.field,
       operator: child.operator,
-      value: child.value
+      value: String(child.value ?? "")
     });
   }
   return values;
@@ -274,7 +327,14 @@ function normalizeExprNode(
     if (options?.dropXYFields && /^(x|y)$/i.test(resolvedField)) {
       return null;
     }
-    const cleanedValue = cleanValue(expr.value);
+    const cleanedValue = cleanValue(String(expr.value ?? ""));
+    if (expr.operator === "is null" || expr.operator === "is not null") {
+      return {
+        ...expr,
+        field: resolvedField,
+        value: ""
+      };
+    }
     if (!cleanedValue) {
       return null;
     }
@@ -320,7 +380,7 @@ function shouldDropCountTailCondition(
   if (!nameLikeFields.has(condition.field)) {
     return false;
   }
-  const normalizedValue = condition.value.replace(/%/g, "").replace(/\s+/g, "");
+  const normalizedValue = String(condition.value ?? "").replace(/%/g, "").replace(/\s+/g, "");
   if (!normalizedValue) {
     return true;
   }
@@ -381,7 +441,7 @@ function removeWeakQuestionTailFilters(
     if (!nameLikeFields.has(filter.field)) {
       return true;
     }
-    const normalizedValue = filter.value.replace(/%/g, "").replace(/\s+/g, "");
+    const normalizedValue = String(filter.value ?? "").replace(/%/g, "").replace(/\s+/g, "");
     if (!normalizedValue) {
       return false;
     }
@@ -469,17 +529,41 @@ function applyOperatorHint(
   }
 
   const withoutSameField = dsl.attributeFilter.filter((item) => item.field !== explicit.field);
+  const nextFilters: SpatialQueryDSL["attributeFilter"] = [
+    ...withoutSameField,
+    {
+      field: explicit.field,
+      operator: explicit.operator,
+      value: explicit.value
+    }
+  ];
+  const nextExpr = attributeFiltersToExpr(nextFilters);
   return {
     ...dsl,
-    attributeFilter: [
-      ...withoutSameField,
-      {
-        field: explicit.field,
-        operator: explicit.operator,
-        value: explicit.value
-      }
-    ]
+    filterExpr: nextExpr ?? undefined,
+    attributeFilter: nextFilters
   };
+}
+
+function shouldForceExplicitOperator(operator: FilterOperator): boolean {
+  return ["!=", "in", "not in", "between", "is null", "is not null"].includes(operator);
+}
+
+function canReplaceWithExplicitCondition(
+  dsl: SpatialQueryDSL,
+  explicit: { field: string; operator: FilterOperator; value: string } | null
+): boolean {
+  if (!explicit) {
+    return false;
+  }
+  if (!dsl.filterExpr) {
+    return true;
+  }
+  const flattened = flattenExprToAndFilters(dsl.filterExpr);
+  if (flattened.length === 0) {
+    return false;
+  }
+  return flattened.every((item) => item.field === explicit.field);
 }
 
 function normalizeFilterValues(
@@ -531,11 +615,15 @@ function normalizeFilterValues(
   );
   const isNearestMode = withCountCleanup.intent === "nearest";
   const hasFilterExpr = Boolean(withCountCleanup.filterExpr);
-  const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode
-    || isNearestMode
-    || hasFilterExpr
+  const explicit = extractFieldCondition(question, layer);
+  const shouldApplyForcedHint = Boolean(
+    explicit && shouldForceExplicitOperator(explicit.operator) && canReplaceWithExplicitCondition(withCountCleanup, explicit)
+  );
+  const withOperatorHint = isSourceBufferMode || isCoordinateBufferMode || isNearestMode
     ? withCountCleanup
-    : applyOperatorHint(question, withCountCleanup, layer);
+    : (shouldApplyForcedHint || !hasFilterExpr)
+      ? applyOperatorHint(question, withCountCleanup, layer)
+      : withCountCleanup;
 
   const sourceLayerKey = withOperatorHint.spatialFilter?.sourceLayer;
   const sourceExpr = withOperatorHint.spatialFilter?.sourceFilterExpr ??
