@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test:chat-regression": "tsx scripts/run-chat-regression.ts"
+    "test:chat-regression": "tsx scripts/run-chat-regression.ts",
+    "test:chat-onboarding": "tsx scripts/generate-layer-smoke-cases.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.1.0",

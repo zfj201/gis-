@@ -55,6 +55,7 @@ const selectedIdsByLayer = new Map<string, Set<string>>();
 const selectedGraphicByKey = new Map<string, any>();
 let hasInitialZoom = false;
 let pendingFocusServiceId: string | null = null;
+let basemapFallbackApplied = false;
 
 function createPopupTemplate(layer: LayerDescriptor): Record<string, unknown> {
   const title = `{${layer.displayField}}`;
@@ -291,6 +292,71 @@ async function addGraphicsInBatches(
   }
 }
 
+function isViewUsable(): boolean {
+  return Boolean(view && !view.destroyed);
+}
+
+async function ensureViewReady(): Promise<boolean> {
+  if (!isViewUsable()) {
+    return false;
+  }
+  if (view.ready) {
+    return true;
+  }
+  try {
+    // 在调用 goTo 前强制等待 view ready，避免 animation 状态未初始化时报错。
+    await view.when();
+    return true;
+  } catch (error) {
+    console.warn("MapView not ready, skip goTo:", error);
+    return false;
+  }
+}
+
+async function safeGoTo(target: any): Promise<boolean> {
+  const ready = await ensureViewReady();
+  if (!ready || !isViewUsable()) {
+    return false;
+  }
+  try {
+    await view.goTo(target);
+    return true;
+  } catch (error) {
+    const message = (error as Error)?.message ?? "";
+    // animation 相关异常通常出现在底图加载抖动阶段，降级为无动画跳转兜底。
+    if (/animation/i.test(message) || /Cannot read properties of undefined/i.test(message)) {
+      try {
+        await view.goTo(target, { animate: false });
+        return true;
+      } catch (fallbackError) {
+        console.error("goTo fallback failed:", fallbackError);
+        return false;
+      }
+    }
+    console.error("goTo failed:", error);
+    return false;
+  }
+}
+
+function installBasemapErrorFallback(): void {
+  if (!isViewUsable()) {
+    return;
+  }
+  view.on("layerview-create-error", (event: any) => {
+    const layerType = String(event?.layer?.type ?? "");
+    if (layerType !== "vector-tile") {
+      return;
+    }
+    if (basemapFallbackApplied || !mapRef) {
+      return;
+    }
+    basemapFallbackApplied = true;
+    console.warn("Basemap layerview creation failed, fallback to empty basemap:", event?.error);
+    // 底图服务不可达时降级为空底图，保证业务图层与空间分析仍可用。
+    mapRef.basemap = { baseLayers: [] };
+  });
+}
+
 async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
   if (!mapRef || !FeatureLayerCtor) {
     return;
@@ -350,8 +416,10 @@ async function syncFeatureLayers(nextLayers: LayerDescriptor[]): Promise<void> {
       try {
         await firstVisible.load();
         if (firstVisible.fullExtent) {
-          await view?.goTo(firstVisible.fullExtent.expand(1.15));
-          hasInitialZoom = true;
+          const success = await safeGoTo(firstVisible.fullExtent.expand(1.15));
+          if (success) {
+            hasInitialZoom = true;
+          }
         }
       } catch (error) {
         console.error("Layer initial extent load failed:", error);
@@ -472,7 +540,7 @@ async function goToServiceExtent(serviceId: string): Promise<void> {
 
   try {
     const target = typeof mergedExtent.expand === "function" ? mergedExtent.expand(1.12) : mergedExtent;
-    await view.goTo(target);
+    await safeGoTo(target);
   } catch (error) {
     console.error("Service goTo failed:", error);
   }
@@ -620,6 +688,8 @@ async function initMap(): Promise<void> {
     spatialReference: { wkid: 3857 }
   });
 
+  installBasemapErrorFallback();
+  await ensureViewReady();
   await syncFeatureLayers(props.layers);
   view.on("click", (event: any) => {
     void handleMapClick(event);
@@ -697,7 +767,7 @@ async function initMap(): Promise<void> {
       if (props.bufferOverlay) {
         return;
       }
-      await view.goTo(highlightLayer.graphics.toArray());
+      await safeGoTo(highlightLayer.graphics.toArray());
     },
     { deep: true }
   );
@@ -768,7 +838,7 @@ async function initMap(): Promise<void> {
         return;
       }
       if (bufferGeometry.extent) {
-        await view.goTo(bufferGeometry.extent.expand(1.2));
+        await safeGoTo(bufferGeometry.extent.expand(1.2));
       }
     },
     { deep: true }

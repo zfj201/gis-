@@ -1,0 +1,412 @@
+[
+  {
+    "id": "T-001",
+    "question": "查询标准名称为南二环的道路街巷",
+    "tags": [
+      "operator",
+      "eq",
+      "search"
+    ]
+  },
+  {
+    "id": "T-002",
+    "question": "名称包含公园的公园有哪些",
+    "tags": [
+      "operator",
+      "like",
+      "search"
+    ]
+  },
+  {
+    "id": "T-003",
+    "question": "标准名称不等于南二环的道路街巷",
+    "tags": [
+      "operator",
+      "neq",
+      "search"
+    ]
+  },
+  {
+    "id": "T-004",
+    "question": "面积大于100的宗地院落",
+    "tags": [
+      "operator",
+      "gt",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-005",
+    "question": "面积至少100的宗地院落",
+    "tags": [
+      "operator",
+      "gte",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-006",
+    "question": "面积小于100的宗地院落",
+    "tags": [
+      "operator",
+      "lt",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-007",
+    "question": "周长不超过300的宗地院落",
+    "tags": [
+      "operator",
+      "lte",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-008",
+    "question": "objectid在95、96、97中的宗地院落",
+    "tags": [
+      "operator",
+      "in",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-009",
+    "question": "objectid不在95,96,97里的宗地院落",
+    "tags": [
+      "operator",
+      "not_in",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-010",
+    "question": "objectid介于100到120之间的宗地院落",
+    "tags": [
+      "operator",
+      "between",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-011",
+    "question": "标准名称为空的道路街巷",
+    "tags": [
+      "operator",
+      "is_null",
+      "search"
+    ]
+  },
+  {
+    "id": "T-012",
+    "question": "标准名称不为空的道路街巷",
+    "tags": [
+      "operator",
+      "is_not_null",
+      "search"
+    ]
+  },
+  {
+    "id": "T-013",
+    "question": "面积小于100且周长不超过300的宗地院落",
+    "tags": [
+      "logic",
+      "and",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-014",
+    "question": "面积小于20或周长超过900的宗地院落",
+    "tags": [
+      "logic",
+      "or",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-015",
+    "question": "列出仓山区前20个公园名称",
+    "tags": [
+      "intent",
+      "search",
+      "limit"
+    ]
+  },
+  {
+    "id": "T-016",
+    "question": "鼓楼区公园有多少个",
+    "tags": [
+      "intent",
+      "count"
+    ]
+  },
+  {
+    "id": "T-017",
+    "question": "按区县统计公园数量",
+    "tags": [
+      "intent",
+      "group_stat"
+    ]
+  },
+  {
+    "id": "T-018",
+    "question": "13303000,2996000 500米内的公园",
+    "tags": [
+      "buffer",
+      "center",
+      "search"
+    ]
+  },
+  {
+    "id": "T-019",
+    "question": "x:13303000,y:2996000 500米内公园有多少个",
+    "tags": [
+      "buffer",
+      "center",
+      "count"
+    ]
+  },
+  {
+    "id": "T-020",
+    "question": "x:13303000,y:2996000 1000米内最近的公园前5个",
+    "tags": [
+      "nearest",
+      "center"
+    ]
+  },
+  {
+    "id": "T-021",
+    "question": "x:13303000,y:2996000 2公里内最近的公园前3个",
+    "tags": [
+      "nearest",
+      "center",
+      "km"
+    ]
+  },
+  {
+    "id": "T-022",
+    "question": "标准名称为南二环的道路街巷100米内的门牌号码",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "line_to_point"
+    ]
+  },
+  {
+    "id": "T-023",
+    "question": "OBJECTID为45854的宗地院落80米内的道路街巷",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "polygon_to_line"
+    ]
+  },
+  {
+    "id": "T-024",
+    "question": "面积小于100的宗地院落80米内的道路街巷",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "numeric_filter"
+    ]
+  },
+  {
+    "id": "T-025",
+    "question": "标准名称为南二环的道路街巷相交的门牌号码",
+    "tags": [
+      "relation",
+      "intersects"
+    ]
+  },
+  {
+    "id": "T-026",
+    "question": "OBJECTID为45854的宗地院落包含的门牌号码",
+    "tags": [
+      "relation",
+      "contains"
+    ]
+  },
+  {
+    "id": "T-027",
+    "question": "在OBJECTID为45854的宗地院落内的门牌号码",
+    "tags": [
+      "relation",
+      "within"
+    ]
+  },
+  {
+    "id": "T-028",
+    "question": "与标准名称为南二环的道路街巷相离的门牌号码",
+    "tags": [
+      "relation",
+      "disjoint"
+    ]
+  },
+  {
+    "id": "T-029",
+    "question": "与OBJECTID为45854的宗地院落接触的道路街巷",
+    "tags": [
+      "relation",
+      "touches"
+    ]
+  },
+  {
+    "id": "T-030",
+    "question": "与OBJECTID为45854的宗地院落重叠的宗地院落",
+    "tags": [
+      "relation",
+      "overlaps"
+    ]
+  },
+  {
+    "id": "T-031",
+    "question": "每个宗地院落内门牌号码数量前5个",
+    "tags": [
+      "spatial_join",
+      "count_by_source"
+    ]
+  },
+  {
+    "id": "T-032",
+    "question": "x:13303000,y:2996000 500米、1公里、2公里内公园数量对比",
+    "tags": [
+      "multi_ring",
+      "buffer_stat"
+    ]
+  },
+  {
+    "id": "T-033",
+    "question": "OBJECTID为45854的宗地院落最近的公园前3个",
+    "tags": [
+      "nearest",
+      "source_layer"
+    ]
+  },
+  {
+    "id": "T-034",
+    "question": "和标准名称为南二环的道路街巷相交的门牌号码有多少个",
+    "tags": [
+      "relation",
+      "count"
+    ]
+  },
+  {
+    "id": "T-035",
+    "question": "按行政区划分组统计公园个数",
+    "tags": [
+      "intent",
+      "group_stat",
+      "county_synonym"
+    ]
+  },
+  {
+    "id": "T-036",
+    "question": "宗地院落80米内的道路街巷",
+    "tags": [
+      "follow_up",
+      "missing_source_filter"
+    ],
+    "expect": {
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-037",
+    "question": "查询标准名称为南二环的要素",
+    "tags": [
+      "follow_up",
+      "ambiguous_layer"
+    ],
+    "expect": {
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-038",
+    "question": "三坊七巷附近1公里内的公园",
+    "tags": [
+      "follow_up",
+      "geocode_dependency"
+    ],
+    "expect": {
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-039",
+    "question": "你好",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-040",
+    "question": "今天天气怎么样",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-041",
+    "question": "讲个笑话",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-042",
+    "question": "介绍一下福州美食",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-043",
+    "question": "你是谁",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  },
+  {
+    "id": "T-044",
+    "question": "谢谢你",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  }
+]

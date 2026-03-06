@@ -1,0 +1,111 @@
+[
+  {
+    "id": "T-001",
+    "question": "查询标准名称为南二环的道路街巷",
+    "tags": [
+      "operator",
+      "eq",
+      "search"
+    ]
+  },
+  {
+    "id": "T-002",
+    "question": "名称包含公园的公园有哪些",
+    "tags": [
+      "operator",
+      "like",
+      "search"
+    ]
+  },
+  {
+    "id": "T-004",
+    "question": "面积大于100的宗地院落",
+    "tags": [
+      "operator",
+      "gt",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-006",
+    "question": "面积小于100的宗地院落",
+    "tags": [
+      "operator",
+      "lt",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-008",
+    "question": "objectid在95、96、97中的宗地院落",
+    "tags": [
+      "operator",
+      "in",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-010",
+    "question": "objectid介于100到120之间的宗地院落",
+    "tags": [
+      "operator",
+      "between",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-013",
+    "question": "面积小于100且周长不超过300的宗地院落",
+    "tags": [
+      "logic",
+      "and",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-014",
+    "question": "面积小于20或周长超过900的宗地院落",
+    "tags": [
+      "logic",
+      "or",
+      "numeric"
+    ]
+  },
+  {
+    "id": "T-015",
+    "question": "列出仓山区前20个公园名称",
+    "tags": [
+      "intent",
+      "search",
+      "limit"
+    ]
+  },
+  {
+    "id": "T-016",
+    "question": "鼓楼区公园有多少个",
+    "tags": [
+      "intent",
+      "count"
+    ]
+  },
+  {
+    "id": "T-017",
+    "question": "按区县统计公园数量",
+    "tags": [
+      "intent",
+      "group_stat"
+    ]
+  },
+  {
+    "id": "T-039",
+    "question": "你好",
+    "tags": [
+      "non_spatial"
+    ],
+    "expect": {
+      "requireDsl": false,
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
+  }
+]

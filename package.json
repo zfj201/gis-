@@ -11,6 +11,9 @@
     "dev": "npm run build -w shared && (npm run dev -w backend & npm run dev -w frontend)",
     "dev:backend": "npm run build -w shared && npm run dev -w backend",
     "dev:frontend": "npm run dev -w frontend",
-    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend"
+    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend",
+    "test:chat": "npm run test:chat-regression -w backend -- --cases=backend/testcases/chat-query-cases.json --cases-secondary=backend/testcases/chat-query-cases-variant.json",
+    "test:chat:p1": "npm run test:chat-regression -w backend -- --cases=backend/testcases/chat-query-cases-p1.json",
+    "test:chat:onboarding": "npm run test:chat-onboarding -w backend"
   }
 }

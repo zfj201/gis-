@@ -1,0 +1,144 @@
+[
+  {
+    "id": "T-018",
+    "question": "13303000,2996000 500米内的公园",
+    "tags": [
+      "buffer",
+      "center",
+      "search"
+    ]
+  },
+  {
+    "id": "T-019",
+    "question": "x:13303000,y:2996000 500米内公园有多少个",
+    "tags": [
+      "buffer",
+      "center",
+      "count"
+    ]
+  },
+  {
+    "id": "T-020",
+    "question": "x:13303000,y:2996000 1000米内最近的公园前5个",
+    "tags": [
+      "nearest",
+      "center"
+    ]
+  },
+  {
+    "id": "T-021",
+    "question": "x:13303000,y:2996000 2公里内最近的公园前3个",
+    "tags": [
+      "nearest",
+      "center",
+      "km"
+    ]
+  },
+  {
+    "id": "T-022",
+    "question": "标准名称为南二环的道路街巷100米内的门牌号码",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "line_to_point"
+    ]
+  },
+  {
+    "id": "T-023",
+    "question": "OBJECTID为45854的宗地院落80米内的道路街巷",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "polygon_to_line"
+    ]
+  },
+  {
+    "id": "T-024",
+    "question": "面积小于100的宗地院落80米内的道路街巷",
+    "tags": [
+      "buffer",
+      "source_layer",
+      "numeric_filter"
+    ]
+  },
+  {
+    "id": "T-025",
+    "question": "标准名称为南二环的道路街巷相交的门牌号码",
+    "tags": [
+      "relation",
+      "intersects"
+    ]
+  },
+  {
+    "id": "T-026",
+    "question": "OBJECTID为45854的宗地院落包含的门牌号码",
+    "tags": [
+      "relation",
+      "contains"
+    ]
+  },
+  {
+    "id": "T-027",
+    "question": "在OBJECTID为45854的宗地院落内的门牌号码",
+    "tags": [
+      "relation",
+      "within"
+    ]
+  },
+  {
+    "id": "T-028",
+    "question": "与标准名称为南二环的道路街巷相离的门牌号码",
+    "tags": [
+      "relation",
+      "disjoint"
+    ]
+  },
+  {
+    "id": "T-029",
+    "question": "与OBJECTID为45854的宗地院落接触的道路街巷",
+    "tags": [
+      "relation",
+      "touches"
+    ]
+  },
+  {
+    "id": "T-030",
+    "question": "与OBJECTID为45854的宗地院落重叠的宗地院落",
+    "tags": [
+      "relation",
+      "overlaps"
+    ]
+  },
+  {
+    "id": "T-031",
+    "question": "每个宗地院落内门牌号码数量前5个",
+    "tags": [
+      "spatial_join",
+      "count_by_source"
+    ]
+  },
+  {
+    "id": "T-032",
+    "question": "x:13303000,y:2996000 500米、1公里、2公里内公园数量对比",
+    "tags": [
+      "multi_ring",
+      "buffer_stat"
+    ]
+  },
+  {
+    "id": "T-033",
+    "question": "OBJECTID为45854的宗地院落最近的公园前3个",
+    "tags": [
+      "nearest",
+      "source_layer"
+    ]
+  },
+  {
+    "id": "T-034",
+    "question": "和标准名称为南二环的道路街巷相交的门牌号码有多少个",
+    "tags": [
+      "relation",
+      "count"
+    ]
+  }
+]
