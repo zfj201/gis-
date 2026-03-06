@@ -57,6 +57,22 @@ interface OpenAIMessage {
   content: string;
 }
 
+interface StreamTextOptions {
+  onDelta?: (text: string) => void;
+  signal?: AbortSignal;
+  temperature?: number;
+}
+
+export interface SpatialSummaryInput {
+  question: string;
+  layerName: string;
+  intent: SpatialQueryDSL["intent"];
+  featureCount: number;
+  count?: number | null;
+  analysisType?: string | null;
+  sampleLabels?: string[];
+}
+
 interface SpatialIntentClassificationOutput {
   isSpatial: boolean;
   confidence?: number;
@@ -1624,6 +1640,390 @@ async function chatWithOpenAICompatible(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function wireAbortSignal(target: AbortController, source: AbortSignal | undefined): (() => void) | null {
+  if (!source) {
+    return null;
+  }
+  if (source.aborted) {
+    target.abort(source.reason);
+    return null;
+  }
+  const onAbort = () => {
+    target.abort(source.reason);
+  };
+  source.addEventListener("abort", onAbort, { once: true });
+  return () => source.removeEventListener("abort", onAbort);
+}
+
+function extractDeltaText(delta: unknown): string {
+  if (typeof delta === "string") {
+    return delta;
+  }
+  if (!Array.isArray(delta)) {
+    return "";
+  }
+
+  return delta
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const part = item as { type?: unknown; text?: unknown };
+      if (part.type === "text" && typeof part.text === "string") {
+        return part.text;
+      }
+      return "";
+    })
+    .join("");
+}
+
+async function streamCompletionWithOpenAICompatible(
+  provider: OpenAICompatibleConfig,
+  messages: OpenAIMessage[],
+  options?: StreamTextOptions
+): Promise<string> {
+  if (!provider.apiKey) {
+    throw new Error(`${provider.providerName.toUpperCase()}_API_KEY 未配置`);
+  }
+
+  const controller = new AbortController();
+  const unbindAbort = wireAbortSignal(controller, options?.signal);
+  const timeoutId = setTimeout(() => controller.abort(), provider.timeoutMs);
+
+  try {
+    const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${provider.apiKey}`,
+        ...(provider.extraHeaders ?? {})
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        temperature: options?.temperature ?? 0.4,
+        stream: true,
+        messages
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`${provider.providerName} API 请求失败: ${response.status} ${body}`);
+    }
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const payload = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const content = payload.choices?.[0]?.message?.content?.trim() ?? "";
+      if (!content) {
+        throw new Error(`${provider.providerName} 返回内容为空`);
+      }
+      options?.onDelta?.(content);
+      return content;
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error(`${provider.providerName} 流式响应不可读取`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffered = "";
+    let fullText = "";
+
+    const applyDataLine = (line: string): void => {
+      const text = line.trim();
+      if (!text.startsWith("data:")) {
+        return;
+      }
+      const raw = text.slice(5).trim();
+      if (!raw || raw === "[DONE]") {
+        return;
+      }
+      const payload = JSON.parse(raw) as {
+        error?: { message?: string };
+        choices?: Array<{
+          delta?: { content?: unknown };
+          finish_reason?: string | null;
+        }>;
+      };
+      if (payload.error?.message) {
+        throw new Error(payload.error.message);
+      }
+      const deltaText = extractDeltaText(payload.choices?.[0]?.delta?.content);
+      if (!deltaText) {
+        return;
+      }
+      fullText += deltaText;
+      options?.onDelta?.(deltaText);
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        buffered += decoder.decode();
+        break;
+      }
+      buffered += decoder.decode(value, { stream: true });
+      const chunks = buffered.split(/\n\n/);
+      buffered = chunks.pop() ?? "";
+      for (const chunk of chunks) {
+        const lines = chunk.split(/\r?\n/);
+        for (const line of lines) {
+          applyDataLine(line);
+        }
+      }
+    }
+
+    if (buffered.trim()) {
+      const lines = buffered.split(/\r?\n/);
+      for (const line of lines) {
+        applyDataLine(line);
+      }
+    }
+
+    if (!fullText.trim()) {
+      throw new Error(`${provider.providerName} 返回内容为空`);
+    }
+
+    return fullText.trim();
+  } finally {
+    clearTimeout(timeoutId);
+    unbindAbort?.();
+  }
+}
+
+function buildSpatialSummaryPrompt(input: SpatialSummaryInput): OpenAIMessage[] {
+  const payload = {
+    question: input.question,
+    layerName: input.layerName,
+    intent: input.intent,
+    analysisType: input.analysisType ?? null,
+    featureCount: input.featureCount,
+    count: input.count ?? null,
+    sampleLabels: (input.sampleLabels ?? []).slice(0, 6)
+  };
+
+  return [
+    {
+      role: "system",
+      content: [
+        "你是 GIS 查询结果摘要助手。",
+        "请基于给定结果生成 1-2 句中文总结。",
+        "要求：事实准确，不编造；语气简洁；不要 markdown。"
+      ].join("\n")
+    },
+    {
+      role: "user",
+      content: `请总结以下查询结果：\n${JSON.stringify(payload)}`
+    }
+  ];
+}
+
+async function streamWithProviderFallback(
+  primary: OpenAICompatibleConfig,
+  fallback: OpenAICompatibleConfig | null,
+  messages: OpenAIMessage[],
+  options?: StreamTextOptions
+): Promise<GeneralChatResponse> {
+  let emitted = false;
+  const onDelta = (text: string) => {
+    emitted = true;
+    options?.onDelta?.(text);
+  };
+
+  try {
+    const summary = await streamCompletionWithOpenAICompatible(primary, messages, {
+      ...options,
+      onDelta
+    });
+    return {
+      summary,
+      parserSource: primary.parserSource
+    };
+  } catch (primaryError) {
+    if (!fallback || emitted || options?.signal?.aborted) {
+      throw primaryError;
+    }
+    const summary = await streamCompletionWithOpenAICompatible(fallback, messages, options);
+    return {
+      summary,
+      parserSource: fallback.parserSource
+    };
+  }
+}
+
+export async function answerGeneralQuestionStream(
+  question: string,
+  options?: StreamTextOptions
+): Promise<GeneralChatResponse> {
+  const provider = config.llmProvider.trim().toLowerCase();
+  const messages: OpenAIMessage[] = [
+    { role: "system", content: GENERAL_CHAT_SYSTEM_PROMPT },
+    { role: "user", content: question }
+  ];
+
+  try {
+    if (provider === "gemini") {
+      return await streamWithProviderFallback(
+        {
+          providerName: "gemini",
+          parserSource: "gemini",
+          apiKey: config.geminiApiKey,
+          baseUrl: config.geminiBaseUrl,
+          model: config.geminiModel,
+          timeoutMs: config.geminiTimeoutMs
+        },
+        {
+          providerName: "openrouter",
+          parserSource: "openrouter",
+          apiKey: config.openrouterApiKey,
+          baseUrl: config.openrouterBaseUrl,
+          model: config.openrouterModel,
+          timeoutMs: config.openrouterTimeoutMs,
+          extraHeaders: {
+            ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+            "X-Title": config.openrouterAppName
+          }
+        },
+        messages,
+        options
+      );
+    }
+
+    if (provider === "groq") {
+      return await streamWithProviderFallback(
+        {
+          providerName: "groq",
+          parserSource: "groq",
+          apiKey: config.groqApiKey,
+          baseUrl: config.groqBaseUrl,
+          model: config.groqModel,
+          timeoutMs: config.groqTimeoutMs
+        },
+        null,
+        messages,
+        options
+      );
+    }
+
+    if (provider === "openrouter") {
+      return await streamWithProviderFallback(
+        {
+          providerName: "openrouter",
+          parserSource: "openrouter",
+          apiKey: config.openrouterApiKey,
+          baseUrl: config.openrouterBaseUrl,
+          model: config.openrouterModel,
+          timeoutMs: config.openrouterTimeoutMs,
+          extraHeaders: {
+            ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+            "X-Title": config.openrouterAppName
+          }
+        },
+        null,
+        messages,
+        options
+      );
+    }
+  } catch (error) {
+    if (options?.signal?.aborted) {
+      throw error;
+    }
+    console.warn("[chat-stream] 模型流式失败，回退默认回复:", (error as Error).message);
+  }
+
+  return {
+    summary: "你好，我是空间查询助手。你也可以直接问我空间问题，例如“鼓楼区公园有多少个”。",
+    parserSource: "rule_fallback"
+  };
+}
+
+export async function summarizeSpatialResultStream(
+  input: SpatialSummaryInput,
+  options?: StreamTextOptions
+): Promise<GeneralChatResponse> {
+  const provider = config.llmProvider.trim().toLowerCase();
+  const messages = buildSpatialSummaryPrompt(input);
+
+  if (provider === "gemini") {
+    return streamWithProviderFallback(
+      {
+        providerName: "gemini",
+        parserSource: "gemini",
+        apiKey: config.geminiApiKey,
+        baseUrl: config.geminiBaseUrl,
+        model: config.geminiModel,
+        timeoutMs: config.geminiTimeoutMs
+      },
+      {
+        providerName: "openrouter",
+        parserSource: "openrouter",
+        apiKey: config.openrouterApiKey,
+        baseUrl: config.openrouterBaseUrl,
+        model: config.openrouterModel,
+        timeoutMs: config.openrouterTimeoutMs,
+        extraHeaders: {
+          ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+          "X-Title": config.openrouterAppName
+        }
+      },
+      messages,
+      {
+        ...options,
+        temperature: 0.2
+      }
+    );
+  }
+
+  if (provider === "groq") {
+    return streamWithProviderFallback(
+      {
+        providerName: "groq",
+        parserSource: "groq",
+        apiKey: config.groqApiKey,
+        baseUrl: config.groqBaseUrl,
+        model: config.groqModel,
+        timeoutMs: config.groqTimeoutMs
+      },
+      null,
+      messages,
+      {
+        ...options,
+        temperature: 0.2
+      }
+    );
+  }
+
+  if (provider === "openrouter") {
+    return streamWithProviderFallback(
+      {
+        providerName: "openrouter",
+        parserSource: "openrouter",
+        apiKey: config.openrouterApiKey,
+        baseUrl: config.openrouterBaseUrl,
+        model: config.openrouterModel,
+        timeoutMs: config.openrouterTimeoutMs,
+        extraHeaders: {
+          ...(config.openrouterSiteUrl ? { "HTTP-Referer": config.openrouterSiteUrl } : {}),
+          "X-Title": config.openrouterAppName
+        }
+      },
+      null,
+      messages,
+      {
+        ...options,
+        temperature: 0.2
+      }
+    );
+  }
+
+  throw new Error(`LLM_PROVIDER=${provider} 不支持流式摘要`);
 }
 
 export async function isSpatialQuestion(question: string): Promise<boolean> {

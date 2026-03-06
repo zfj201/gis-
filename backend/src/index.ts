@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import {
   type ExecuteResponse,
   type ParseResponse,
+  type QueryPlan,
   spatialQueryDslSchema,
   type SpatialQueryDSL
 } from "@gis/shared";
@@ -13,13 +14,95 @@ import { isUserFacingError } from "./errors.js";
 import { layerRegistry } from "./layer-registry.js";
 import { summarizeResult } from "./narrator.js";
 import { defaultOutputFields } from "./semantic-routing.js";
-import { answerGeneralQuestion, isSpatialQuestion, parseQuestionSmart } from "./semantic-llm.js";
+import {
+  answerGeneralQuestion,
+  answerGeneralQuestionStream,
+  isSpatialQuestion,
+  parseQuestionSmart,
+  summarizeSpatialResultStream
+} from "./semantic-llm.js";
 import { executeDsl } from "./spatial-executor.js";
 
 const app = Fastify({ logger: true });
 
 const MAX_EXPORT_PAGE_SIZE = 5000;
 const SELECTED_IN_CLAUSE_CHUNK = 800;
+type StreamDoneStatus = "completed" | "aborted" | "error";
+type ResponseExecutionMeta = {
+  truncated: boolean;
+  safetyCap: number;
+  fetched: number;
+  requestedLimit: number;
+  mapDisplayLimit?: number;
+  mapDisplayTotal?: number;
+  mapDisplayTruncated?: boolean;
+};
+
+function mapHighlightLimit(): number {
+  const raw = Number(config.mapHighlightMaxFeatures);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 2000;
+  }
+  return Math.max(1, Math.floor(raw));
+}
+
+function applyMapHighlightCap(
+  features: Array<Record<string, unknown>>,
+  executionMeta: Record<string, unknown> | undefined,
+  totalHint?: number | null
+): {
+  features: Array<Record<string, unknown>>;
+  executionMeta: ResponseExecutionMeta | undefined;
+} {
+  const limit = mapHighlightLimit();
+  const source = Array.isArray(features) ? features : [];
+  const totalFromHint =
+    typeof totalHint === "number" && Number.isFinite(totalHint)
+      ? Math.max(0, Math.floor(totalHint))
+      : null;
+  const cappedByLength = source.length > limit;
+  const cappedFeatures = cappedByLength ? source.slice(0, limit) : source;
+  const total = totalFromHint ?? source.length;
+  const mapDisplayTruncated = cappedByLength || (totalFromHint !== null && totalFromHint > cappedFeatures.length);
+
+  if (!executionMeta && !mapDisplayTruncated) {
+    return {
+      features: cappedFeatures,
+      executionMeta: undefined
+    };
+  }
+
+  const normalizeNumber = (value: unknown, fallback: number): number => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return fallback;
+    }
+    return parsed;
+  };
+
+  const baseFetched = normalizeNumber((executionMeta as { fetched?: unknown } | undefined)?.fetched, source.length);
+  const baseSafetyCap = normalizeNumber(
+    (executionMeta as { safetyCap?: unknown } | undefined)?.safetyCap,
+    Math.max(limit, baseFetched)
+  );
+  const baseRequestedLimit = normalizeNumber(
+    (executionMeta as { requestedLimit?: unknown } | undefined)?.requestedLimit,
+    Math.max(total, baseFetched)
+  );
+
+  return {
+    features: cappedFeatures,
+    executionMeta: {
+      truncated: Boolean((executionMeta as { truncated?: unknown } | undefined)?.truncated),
+      safetyCap: baseSafetyCap,
+      fetched: baseFetched,
+      requestedLimit: baseRequestedLimit,
+      mapDisplayLimit: limit,
+      mapDisplayTotal: total,
+      mapDisplayTruncated
+    }
+  };
+}
 
 function buildVisualizationDsl(
   dsl: SpatialQueryDSL,
@@ -40,7 +123,8 @@ function buildVisualizationDsl(
     const count = Number(payload.count ?? 0);
     const visualLimit = Math.min(
       Math.max(0, Number.isFinite(count) ? count : 0),
-      Math.max(1, config.queryMaxFeatures)
+      Math.max(1, config.queryMaxFeatures),
+      mapHighlightLimit()
     );
     if (visualLimit <= 0) {
       return null;
@@ -64,7 +148,7 @@ function buildVisualizationDsl(
     targetLayer: targetLayer.layerKey,
     intent: "search",
     aggregation: null,
-    limit: Math.max(1, config.queryMaxFeatures),
+    limit: Math.min(Math.max(1, config.queryMaxFeatures), mapHighlightLimit()),
     output: {
       fields: baseOutputFields,
       returnGeometry: true
@@ -147,6 +231,110 @@ function buildSelectedWhere(
     }
   }
   return clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
+}
+
+function pickFeatureLabel(attributes: Record<string, unknown> | undefined): string {
+  if (!attributes) {
+    return "未命名要素";
+  }
+
+  const preferredKeys = ["名称", "标准名称", "门牌号码", "标准地址", "道路街巷", "地址", "区县"];
+  for (const key of preferredKeys) {
+    const raw = attributes[key];
+    if (raw === null || raw === undefined) {
+      continue;
+    }
+    const text = String(raw).trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  for (const raw of Object.values(attributes)) {
+    if (raw === null || raw === undefined) {
+      continue;
+    }
+    const text = String(raw).trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  return "未命名要素";
+}
+
+function createSseWriter(reply: { raw: NodeJS.WritableStream & { writableEnded?: boolean; writable?: boolean } }) {
+  let ended = false;
+
+  const write = (chunk: string): boolean => {
+    if (ended || reply.raw.writableEnded || reply.raw.writable === false) {
+      return false;
+    }
+    reply.raw.write(chunk);
+    return true;
+  };
+
+  const send = (event: string, payload: Record<string, unknown>): boolean => {
+    const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+    return write(data);
+  };
+
+  const end = (status: StreamDoneStatus): void => {
+    if (ended || reply.raw.writableEnded) {
+      return;
+    }
+    send("done", { status });
+    reply.raw.end();
+    ended = true;
+  };
+
+  return {
+    send,
+    end,
+    isEnded: () => ended || reply.raw.writableEnded || reply.raw.writable === false
+  };
+}
+
+async function executeSpatialChatDsl(dsl: SpatialQueryDSL): Promise<{
+  plan: QueryPlan;
+  payload: Record<string, unknown>;
+  features: Array<Record<string, unknown>>;
+  executionMeta: ResponseExecutionMeta | undefined;
+  layerName: string;
+}> {
+  const targetLayer = layerRegistry.getLayer(dsl.targetLayer);
+  const layerName = targetLayer?.name ?? "要素";
+  const executed = await executeDsl(dsl);
+  const plan = executed.plan;
+  const payload = executed.payload;
+  let executionMeta = executed.executionMeta;
+  let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
+
+  if (typeof payload.count === "number" || dsl.intent === "group_stat") {
+    const visualDsl = buildVisualizationDsl(dsl, payload);
+    if (visualDsl) {
+      const visualExecuted = await executeDsl(visualDsl);
+      const visualPayload = visualExecuted.payload;
+      executionMeta = visualExecuted.executionMeta ?? executionMeta;
+      features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
+    } else {
+      features = [];
+    }
+  }
+
+  const mapCapped = applyMapHighlightCap(
+    features,
+    executionMeta as Record<string, unknown> | undefined,
+    typeof payload.count === "number" ? Number(payload.count) : null
+  );
+
+  return {
+    plan,
+    payload,
+    features: mapCapped.features,
+    executionMeta: mapCapped.executionMeta,
+    layerName
+  };
 }
 
 await app.register(cors, {
@@ -403,23 +591,7 @@ app.post<{ Body: { dsl: SpatialQueryDSL } }>("/api/spatial/execute", async (req,
   try {
     const targetLayer = layerRegistry.getLayer(result.data.targetLayer);
     const layerName = targetLayer?.name ?? "要素";
-    const executed = await executeDsl(result.data);
-    const plan = executed.plan;
-    const payload = executed.payload;
-    let executionMeta = executed.executionMeta;
-    let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
-
-    if (typeof payload.count === "number" || result.data.intent === "group_stat") {
-      const visualDsl = buildVisualizationDsl(result.data, payload);
-      if (visualDsl) {
-        const visualExecuted = await executeDsl(visualDsl);
-        const visualPayload = visualExecuted.payload;
-        executionMeta = visualExecuted.executionMeta ?? executionMeta;
-        features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
-      } else {
-        features = [];
-      }
-    }
+    const { plan, payload, executionMeta, features } = await executeSpatialChatDsl(result.data);
 
     const response: ExecuteResponse & { targetLayerName: string } = {
       resolvedEntities: [],
@@ -494,25 +666,7 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
   }
 
   try {
-    const targetLayer = layerRegistry.getLayer(parsed.dsl.targetLayer);
-    const layerName = targetLayer?.name ?? "要素";
-    const executed = await executeDsl(parsed.dsl);
-    const plan = executed.plan;
-    const payload = executed.payload;
-    let executionMeta = executed.executionMeta;
-    let features = ((payload.features as Array<Record<string, unknown>>) ?? []);
-
-    if (typeof payload.count === "number" || parsed.dsl.intent === "group_stat") {
-      const visualDsl = buildVisualizationDsl(parsed.dsl, payload);
-      if (visualDsl) {
-        const visualExecuted = await executeDsl(visualDsl);
-        const visualPayload = visualExecuted.payload;
-        executionMeta = visualExecuted.executionMeta ?? executionMeta;
-        features = ((visualPayload.features as Array<Record<string, unknown>>) ?? []);
-      } else {
-        features = [];
-      }
-    }
+    const { plan, payload, executionMeta, features, layerName } = await executeSpatialChatDsl(parsed.dsl);
 
     return {
       dsl: parsed.dsl,
@@ -554,6 +708,198 @@ app.post<{ Body: { question: string } }>("/api/chat/query", async (req, reply) =
       dsl: parsed.dsl,
       parserSource: parsed.parserSource
     });
+  }
+});
+
+app.post<{ Body: { question: string } }>("/api/chat/query/stream", async (req, reply) => {
+  const question = String(req.body?.question ?? "").trim();
+  if (!question) {
+    return reply.code(400).send({ message: "question 不能为空" });
+  }
+
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  (reply.raw as { flushHeaders?: () => void }).flushHeaders?.();
+
+  const writer = createSseWriter(reply);
+  const clientAbort = new AbortController();
+  const onClientAbort = () => {
+    if (writer.isEnded()) {
+      return;
+    }
+    clientAbort.abort();
+    writer.end("aborted");
+  };
+  req.raw.on("aborted", onClientAbort);
+  reply.raw.on("close", onClientAbort);
+
+  const finish = (status: StreamDoneStatus): void => {
+    req.raw.off("aborted", onClientAbort);
+    reply.raw.off("close", onClientAbort);
+    writer.end(status);
+  };
+
+  try {
+    if (!(await isSpatialQuestion(question))) {
+      if (writer.isEnded()) {
+        return;
+      }
+      writer.send("stage", { stage: "general_chat_generating", message: "正在生成回复" });
+      let streamed = "";
+      const general = await answerGeneralQuestionStream(question, {
+        signal: clientAbort.signal,
+        onDelta: (text) => {
+          streamed += text;
+          writer.send("delta", { text });
+        }
+      });
+
+      if (!streamed.trim() && general.summary.trim()) {
+        streamed = general.summary;
+        writer.send("delta", { text: general.summary });
+      }
+
+      writer.send("final", {
+        dsl: null,
+        resolvedEntities: [],
+        queryPlan: null,
+        features: [],
+        summary: general.summary,
+        followUpQuestion: null,
+        parserSource: general.parserSource,
+        parserFailureReason: null,
+        parserFailureDetail: null,
+        normalizedByRule: false,
+        semanticWarnings: null,
+        semanticMeta: {
+          retrievalHits: 0,
+          modelAttempts: 0,
+          repaired: false,
+          decisionPath: "general_chat"
+        },
+        summarySource: general.parserSource === "rule_fallback" ? "rule_fallback" : "llm_stream"
+      });
+      finish(clientAbort.signal.aborted ? "aborted" : "completed");
+      return;
+    }
+
+    writer.send("stage", { stage: "semantic_parsing", message: "语义解析中" });
+    const parsed = await parseQuestionSmart(question, { assumeSpatial: true });
+    if (clientAbort.signal.aborted || writer.isEnded()) {
+      finish("aborted");
+      return;
+    }
+
+    if (parsed.followUpQuestion) {
+      writer.send("final", {
+        dsl: parsed.dsl,
+        resolvedEntities: [],
+        queryPlan: null,
+        features: [],
+        summary: parsed.followUpQuestion,
+        followUpQuestion: parsed.followUpQuestion,
+        parserSource: parsed.parserSource,
+        parserFailureReason: parsed.parserFailureReason ?? null,
+        parserFailureDetail: parsed.parserFailureDetail ?? null,
+        normalizedByRule: parsed.normalizedByRule ?? false,
+        semanticWarnings: parsed.semanticWarnings ?? null,
+        semanticMeta: parsed.semanticMeta ?? null,
+        summarySource: "follow_up"
+      });
+      finish("completed");
+      return;
+    }
+
+    writer.send("stage", { stage: "spatial_executing", message: "空间执行中" });
+    const { plan, payload, executionMeta, features, layerName } = await executeSpatialChatDsl(parsed.dsl);
+    if (clientAbort.signal.aborted || writer.isEnded()) {
+      finish("aborted");
+      return;
+    }
+
+    writer.send("stage", { stage: "summary_generating", message: "摘要生成中" });
+    let streamed = "";
+    let summary = summarizeResult(parsed.dsl, payload, layerName);
+    let summarySource = "narrator";
+    try {
+      const streamedSummary = await summarizeSpatialResultStream(
+        {
+          question,
+          layerName,
+          intent: parsed.dsl.intent,
+          featureCount: features.length,
+          count: typeof payload.count === "number" ? Number(payload.count) : null,
+          analysisType: typeof plan.analysisType === "string" ? plan.analysisType : null,
+          sampleLabels: features
+            .slice(0, 5)
+            .map((feature) => pickFeatureLabel(feature.attributes as Record<string, unknown> | undefined))
+        },
+        {
+          signal: clientAbort.signal,
+          onDelta: (text) => {
+            streamed += text;
+            writer.send("delta", { text });
+          }
+        }
+      );
+      summary = streamedSummary.summary;
+      summarySource = "llm_stream";
+    } catch (error) {
+      if (clientAbort.signal.aborted) {
+        finish("aborted");
+        return;
+      }
+      req.log.warn(
+        { reason: (error as Error).message },
+        "[chat-stream] spatial summary stream failed, fallback to narrator"
+      );
+      summary = summarizeResult(parsed.dsl, payload, layerName);
+      summarySource = "narrator_fallback";
+      if (!streamed.trim() && summary.trim()) {
+        streamed = summary;
+        writer.send("delta", { text: summary });
+      }
+      writer.send("error", { message: "流式摘要失败，已回退规则摘要。" });
+    }
+
+    if (!streamed.trim() && summary.trim()) {
+      writer.send("delta", { text: summary });
+    }
+
+    writer.send("final", {
+      dsl: parsed.dsl,
+      resolvedEntities: [],
+      queryPlan: plan,
+      features,
+      summary,
+      followUpQuestion: parsed.followUpQuestion,
+      executionMeta,
+      parserSource: parsed.parserSource,
+      parserFailureReason: parsed.parserFailureReason ?? null,
+      parserFailureDetail: parsed.parserFailureDetail ?? null,
+      normalizedByRule: parsed.normalizedByRule ?? false,
+      semanticWarnings: parsed.semanticWarnings ?? null,
+      semanticMeta: parsed.semanticMeta ?? null,
+      targetLayerName: layerName,
+      summarySource
+    });
+
+    finish(clientAbort.signal.aborted ? "aborted" : "completed");
+  } catch (error) {
+    if (clientAbort.signal.aborted || writer.isEnded()) {
+      finish("aborted");
+      return;
+    }
+    req.log.error(error);
+    writer.send("error", {
+      message: (error as Error).message || "流式查询失败"
+    });
+    finish("error");
   }
 });
 

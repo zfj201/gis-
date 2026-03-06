@@ -27,6 +27,7 @@
 - `POST /api/semantic/parse`
 - `POST /api/spatial/execute`
 - `POST /api/chat/query`
+- `POST /api/chat/query/stream`（SSE 流式输出）
 - `GET /api/layers/catalog`
 - `POST /api/layers/catalog/register`
 - `DELETE /api/layers/catalog/service/:serviceId`
@@ -59,6 +60,16 @@ npm run dev:frontend
 - Frontend: `http://localhost:5173`
 - Backend: `http://localhost:3300`
 
+## Chat 流式接口（SSE）
+
+新增 `POST /api/chat/query/stream`，返回 `text/event-stream`。  
+事件约定：
+- `stage`：阶段事件（`semantic_parsing` / `spatial_executing` / `summary_generating` / `general_chat_generating`）
+- `delta`：增量文本分片（实时打字）
+- `final`：最终完整响应（结构同 `/api/chat/query`，并附带 `summarySource`）
+- `error`：流式过程错误（若可回退会继续给出 `final`）
+- `done`：结束状态（`completed` / `aborted` / `error`）
+
 ## Environment Variables (Backend)
 
 - `PORT`（默认 `3300`）
@@ -70,6 +81,7 @@ npm run dev:frontend
 - `MAX_REGISTERED_SERVICES`（最大可注册服务数，默认 `20`）
 - `DEFAULT_RADIUS_METERS`（默认 `5000`）
 - `MAX_RADIUS_METERS`（默认 `0`，`<=0` 表示不限制）
+- `MAP_HIGHLIGHT_MAX_FEATURES`（地图高亮上限，默认 `2000`，超出部分仅在文本摘要体现总数）
 - `LLM_PROVIDER`（`rule` / `gemini` / `groq` / `openrouter`，默认 `rule`）
 - `GEMINI_API_KEY`（启用 Gemini 必填）
 - `GEMINI_BASE_URL`（默认 `https://generativelanguage.googleapis.com/v1beta/openai`）

@@ -19,11 +19,15 @@ interface ChatResponse {
   normalizedByRule?: boolean;
   semanticWarnings?: string[] | null;
   targetLayerName?: string;
+  summarySource?: string;
   executionMeta?: {
     truncated?: boolean;
     safetyCap?: number;
     fetched?: number;
     requestedLimit?: number;
+    mapDisplayLimit?: number;
+    mapDisplayTotal?: number;
+    mapDisplayTruncated?: boolean;
   };
   semanticMeta?: {
     retrievalHits?: number;
@@ -36,6 +40,13 @@ interface ChatResponse {
     candidateScore?: number;
   } | null;
 }
+
+type StreamDoneStatus = "completed" | "aborted" | "error";
+type StreamStage =
+  | "semantic_parsing"
+  | "spatial_executing"
+  | "summary_generating"
+  | "general_chat_generating";
 
 interface QueryPlanLike {
   geometry?: Record<string, unknown> | null;
@@ -121,6 +132,9 @@ interface ChatMessage {
     safetyCap: number;
     fetched: number;
     requestedLimit: number;
+    mapDisplayLimit?: number;
+    mapDisplayTotal?: number;
+    mapDisplayTruncated?: boolean;
   };
   nearestMeta?: {
     topK: number;
@@ -139,6 +153,7 @@ interface ChatMessage {
     chosenCandidate?: "model" | "rule" | "repaired_model";
     candidateScore?: number;
   } | null;
+  streamStage?: string | null;
 }
 
 const question = ref("");
@@ -159,6 +174,7 @@ const backendStatus = ref<"unknown" | "up" | "down">("unknown");
 const featuresForMap = ref<FeatureItem[]>([]);
 const bufferOverlayForMap = ref<BufferOverlay | null>(null);
 const mapResponseNonce = ref(0);
+const activeQueryController = ref<AbortController | null>(null);
 const layerCatalog = ref<LayerCatalogResponse>({
   services: [],
   layers: []
@@ -273,11 +289,39 @@ function analysisMetaLinesFromPlan(plan: Record<string, unknown> | null | undefi
   return null;
 }
 
-function pushMessage(message: Omit<ChatMessage, "id">): void {
+function pushMessage(message: Omit<ChatMessage, "id">): number {
+  const id = messageId++;
   chatMessages.value.push({
-    id: messageId++,
+    id,
     ...message
   });
+  return id;
+}
+
+function patchMessage(id: number, patch: Partial<ChatMessage>): void {
+  const index = chatMessages.value.findIndex((item) => item.id === id);
+  if (index < 0) {
+    return;
+  }
+  chatMessages.value[index] = {
+    ...chatMessages.value[index],
+    ...patch
+  };
+}
+
+function appendMessageText(id: number, text: string): void {
+  if (!text) {
+    return;
+  }
+  const index = chatMessages.value.findIndex((item) => item.id === id);
+  if (index < 0) {
+    return;
+  }
+  const current = chatMessages.value[index];
+  chatMessages.value[index] = {
+    ...current,
+    text: `${current.text}${text}`
+  };
 }
 
 function parserSourceLabel(source: ParserSource | undefined): string {
@@ -324,12 +368,115 @@ function parserFailureReasonLabel(reason: string | null | undefined): string {
   return reason;
 }
 
+function streamStageLabel(stage: StreamStage | string | undefined): string {
+  if (stage === "semantic_parsing") {
+    return "语义解析中";
+  }
+  if (stage === "spatial_executing") {
+    return "空间执行中";
+  }
+  if (stage === "summary_generating") {
+    return "摘要生成中";
+  }
+  if (stage === "general_chat_generating") {
+    return "回复生成中";
+  }
+  return stage ? String(stage) : "";
+}
+
+function normalizeSemanticMeta(
+  raw: ChatResponse["semanticMeta"]
+): ChatMessage["semanticMeta"] {
+  if (!raw) {
+    return null;
+  }
+  return {
+    retrievalHits: Number(raw.retrievalHits ?? 0),
+    modelAttempts: Number(raw.modelAttempts ?? 0),
+    repaired: Boolean(raw.repaired),
+    decisionPath: String(raw.decisionPath ?? ""),
+    gateDecision:
+      raw.gateDecision === "spatial" ||
+      raw.gateDecision === "non_spatial" ||
+      raw.gateDecision === "uncertain"
+        ? raw.gateDecision
+        : undefined,
+    candidateCount: Number.isFinite(Number(raw.candidateCount))
+      ? Number(raw.candidateCount)
+      : undefined,
+    chosenCandidate:
+      raw.chosenCandidate === "model" ||
+      raw.chosenCandidate === "rule" ||
+      raw.chosenCandidate === "repaired_model"
+        ? raw.chosenCandidate
+        : undefined,
+    candidateScore: Number.isFinite(Number(raw.candidateScore))
+      ? Number(raw.candidateScore)
+      : undefined
+  };
+}
+
+function applyMapPayload(parsed: ChatResponse): void {
+  mapResponseNonce.value += 1;
+  bufferOverlayForMap.value = toBufferOverlay(parsed.queryPlan ?? null);
+  featuresForMap.value = (parsed.features as FeatureItem[] | undefined) ?? [];
+  querySelectedIdsByLayer.value = {};
+  const targetLayerKey = String((parsed.dsl as { targetLayer?: unknown } | null)?.targetLayer ?? "").trim() || undefined;
+  if (targetLayerKey) {
+    updateQuerySelectedObjectIds(targetLayerKey, featuresForMap.value);
+  }
+}
+
+function patchAssistantMessageWithFinal(assistantId: number, parsed: ChatResponse): void {
+  applyMapPayload(parsed);
+  const targetLayerName =
+    parsed.targetLayerName ?? targetLayerNameFromDsl(parsed.dsl as Record<string, unknown> | null);
+  const current = chatMessages.value.find((item) => item.id === assistantId);
+  patchMessage(assistantId, {
+    text: parsed.summary || parsed.followUpQuestion || parsed.message || current?.text || "已处理请求。",
+    followUpQuestion: parsed.followUpQuestion ?? null,
+    dsl: (parsed.dsl as Record<string, unknown> | undefined) ?? undefined,
+    queryPlan: parsed.queryPlan ?? null,
+    featureCount: parsed.features?.length ?? 0,
+    error: parsed.error,
+    parserSource: parsed.parserSource,
+    parserFailureReason: parsed.parserFailureReason ?? null,
+    parserFailureDetail: parsed.parserFailureDetail ?? null,
+    normalizedByRule: parsed.normalizedByRule ?? false,
+    semanticWarnings: parsed.semanticWarnings ?? null,
+    targetLayerName,
+    executionMeta: parsed.executionMeta
+      ? {
+          truncated: Boolean(parsed.executionMeta.truncated),
+          safetyCap: Number(parsed.executionMeta.safetyCap ?? 0),
+          fetched: Number(parsed.executionMeta.fetched ?? 0),
+          requestedLimit: Number(parsed.executionMeta.requestedLimit ?? 0),
+          mapDisplayLimit: Number(parsed.executionMeta.mapDisplayLimit ?? 0),
+          mapDisplayTotal: Number(parsed.executionMeta.mapDisplayTotal ?? 0),
+          mapDisplayTruncated: Boolean(parsed.executionMeta.mapDisplayTruncated)
+        }
+      : undefined,
+    nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null),
+    analysisMetaLines: analysisMetaLinesFromPlan(parsed.queryPlan ?? null),
+    semanticMeta: normalizeSemanticMeta(parsed.semanticMeta),
+    streamStage: null
+  });
+}
+
+function stopStreaming(): void {
+  activeQueryController.value?.abort();
+}
+
 function featureCountText(message: ChatMessage): string {
   const count = message.featureCount ?? 0;
   if (count <= 0) {
     return "";
   }
   const executionMeta = message.executionMeta;
+  if (executionMeta?.mapDisplayTruncated) {
+    const total = Number(executionMeta.mapDisplayTotal ?? count);
+    return `地图高亮仅展示 ${count} 条，总计 ${total} 条`;
+  }
   if (executionMeta?.truncated) {
     return `命中 ${count} 条要素（已触发安全阈值 ${executionMeta.safetyCap}，结果已截断）`;
   }
@@ -750,6 +897,9 @@ async function toggleServiceVisibility(serviceId: string, checked: boolean): Pro
 }
 
 async function runQuery(): Promise<void> {
+  if (loading.value) {
+    return;
+  }
   const text = question.value.trim();
   if (!text) {
     return;
@@ -763,112 +913,153 @@ async function runQuery(): Promise<void> {
   await scrollToBottom();
 
   loading.value = true;
+  const assistantId = pushMessage({
+    role: "assistant",
+    text: "",
+    streamStage: "正在连接..."
+  });
+  const controller = new AbortController();
+  activeQueryController.value = controller;
+
   try {
-    const res = await fetch("/api/chat/query", {
+    const res = await fetch("/api/chat/query/stream", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ question: text })
+      body: JSON.stringify({ question: text }),
+      signal: controller.signal
     });
-
-    const contentType = res.headers.get("content-type") ?? "";
-    const bodyText = await res.text();
 
     if (!res.ok) {
-      pushMessage({
-        role: "assistant",
+      const bodyText = await res.text();
+      patchMessage(assistantId, {
         text: "请求失败，请稍后重试。",
-        error: bodyText || `HTTP ${res.status}`
+        error: bodyText || `HTTP ${res.status}`,
+        streamStage: null
       });
       return;
     }
 
-    if (!contentType.includes("application/json")) {
-      pushMessage({
-        role: "assistant",
+    if (!res.body) {
+      patchMessage(assistantId, {
         text: "后端响应格式错误。",
-        error: `后端返回了非 JSON 响应（${contentType || "unknown"}）`
+        error: "后端返回了空流响应。",
+        streamStage: null
       });
       return;
     }
 
-    const parsed = JSON.parse(bodyText) as ChatResponse;
-    mapResponseNonce.value += 1;
-    bufferOverlayForMap.value = toBufferOverlay(parsed.queryPlan ?? null);
-    featuresForMap.value = (parsed.features as FeatureItem[] | undefined) ?? [];
-    querySelectedIdsByLayer.value = {};
-    const targetLayerKey = String((parsed.dsl as { targetLayer?: unknown } | null)?.targetLayer ?? "").trim() || undefined;
-    if (targetLayerKey) {
-      updateQuerySelectedObjectIds(targetLayerKey, featuresForMap.value);
-    }
-    const targetLayerName =
-      parsed.targetLayerName ?? targetLayerNameFromDsl(parsed.dsl as Record<string, unknown> | null);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    let finalPayload: ChatResponse | null = null;
+    let doneStatus: StreamDoneStatus | null = null;
 
-    pushMessage({
-      role: "assistant",
-      text: parsed.summary || parsed.followUpQuestion || parsed.message || "已处理请求。",
-      followUpQuestion: parsed.followUpQuestion ?? null,
-      dsl: (parsed.dsl as Record<string, unknown> | undefined) ?? undefined,
-      queryPlan: parsed.queryPlan ?? null,
-      featureCount: parsed.features?.length ?? 0,
-      error: parsed.error,
-      parserSource: parsed.parserSource,
-      parserFailureReason: parsed.parserFailureReason ?? null,
-      parserFailureDetail: parsed.parserFailureDetail ?? null,
-      normalizedByRule: parsed.normalizedByRule ?? false,
-      semanticWarnings: parsed.semanticWarnings ?? null,
-      targetLayerName,
-      executionMeta: parsed.executionMeta
-        ? {
-            truncated: Boolean(parsed.executionMeta.truncated),
-            safetyCap: Number(parsed.executionMeta.safetyCap ?? 0),
-            fetched: Number(parsed.executionMeta.fetched ?? 0),
-            requestedLimit: Number(parsed.executionMeta.requestedLimit ?? 0)
-          }
-        : undefined,
-      nearestMeta: nearestMetaFromPlan(parsed.queryPlan ?? null),
-      analysisMetaLines: analysisMetaLinesFromPlan(parsed.queryPlan ?? null),
-      semanticMeta: parsed.semanticMeta
-        ? {
-            // 统一在前端做一次类型归一化，避免后端可选字段导致模板判断抖动。
-            retrievalHits: Number(parsed.semanticMeta.retrievalHits ?? 0),
-            modelAttempts: Number(parsed.semanticMeta.modelAttempts ?? 0),
-            repaired: Boolean(parsed.semanticMeta.repaired),
-            decisionPath: String(parsed.semanticMeta.decisionPath ?? ""),
-            gateDecision:
-              parsed.semanticMeta.gateDecision === "spatial" ||
-              parsed.semanticMeta.gateDecision === "non_spatial" ||
-              parsed.semanticMeta.gateDecision === "uncertain"
-                ? parsed.semanticMeta.gateDecision
-                : undefined,
-            candidateCount: Number.isFinite(Number(parsed.semanticMeta.candidateCount))
-              ? Number(parsed.semanticMeta.candidateCount)
-              : undefined,
-            chosenCandidate:
-              parsed.semanticMeta.chosenCandidate === "model" ||
-              parsed.semanticMeta.chosenCandidate === "rule" ||
-              parsed.semanticMeta.chosenCandidate === "repaired_model"
-                ? parsed.semanticMeta.chosenCandidate
-                : undefined,
-            candidateScore: Number.isFinite(Number(parsed.semanticMeta.candidateScore))
-              ? Number(parsed.semanticMeta.candidateScore)
-              : undefined
-          }
-        : null
-    });
+    const handleSseFrame = (frame: string): void => {
+      const lines = frame.split(/\r?\n/);
+      let eventName = "message";
+      const dataLines: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+
+      if (!dataLines.length) {
+        return;
+      }
+      const dataText = dataLines.join("\n");
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(dataText) as Record<string, unknown>;
+      } catch {
+        payload = { raw: dataText };
+      }
+
+      if (eventName === "stage") {
+        const stage = String(payload.stage ?? payload.message ?? "").trim();
+        patchMessage(assistantId, {
+          streamStage: streamStageLabel(stage)
+        });
+        return;
+      }
+
+      if (eventName === "delta") {
+        const textPart = String(payload.text ?? "");
+        appendMessageText(assistantId, textPart);
+        void scrollToBottom();
+        return;
+      }
+
+      if (eventName === "final") {
+        finalPayload = payload as unknown as ChatResponse;
+        patchAssistantMessageWithFinal(assistantId, finalPayload);
+        return;
+      }
+
+      if (eventName === "error") {
+        const current = chatMessages.value.find((item) => item.id === assistantId);
+        patchMessage(assistantId, {
+          error: String(payload.message ?? current?.error ?? "流式请求失败")
+        });
+        return;
+      }
+
+      if (eventName === "done") {
+        const status = String(payload.status ?? "") as StreamDoneStatus;
+        if (status === "completed" || status === "aborted" || status === "error") {
+          doneStatus = status;
+        }
+      }
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffered += decoder.decode();
+        break;
+      }
+      buffered += decoder.decode(value, { stream: true });
+      const frames = buffered.split(/\n\n/);
+      buffered = frames.pop() ?? "";
+      for (const frame of frames) {
+        handleSseFrame(frame);
+      }
+    }
+
+    if (buffered.trim()) {
+      handleSseFrame(buffered);
+    }
+
+    if (!finalPayload && doneStatus === "aborted") {
+      const current = chatMessages.value.find((item) => item.id === assistantId);
+      patchMessage(assistantId, {
+        streamStage: null,
+        text: current?.text?.trim() ? current.text : "已停止生成。"
+      });
+    } else {
+      patchMessage(assistantId, { streamStage: null });
+    }
   } catch (error) {
-    pushMessage({
-      role: "assistant",
+    if ((error as Error).name === "AbortError") {
+      const current = chatMessages.value.find((item) => item.id === assistantId);
+      patchMessage(assistantId, {
+        streamStage: null,
+        text: current?.text?.trim() ? current.text : "已停止生成。"
+      });
+      return;
+    }
+    patchMessage(assistantId, {
+      streamStage: null,
       text: "请求失败，请确认后端服务已启动。",
       error: `${(error as Error).message}。请确认后端服务已启动（默认 http://localhost:3300）`
     });
-    mapResponseNonce.value += 1;
-    featuresForMap.value = [];
-    bufferOverlayForMap.value = null;
-    querySelectedIdsByLayer.value = {};
     backendStatus.value = "down";
   } finally {
+    activeQueryController.value = null;
     loading.value = false;
     await scrollToBottom();
   }
@@ -883,6 +1074,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  activeQueryController.value?.abort();
+  activeQueryController.value = null;
   window.removeEventListener("pointerdown", handleGlobalPointerDown);
   window.removeEventListener("keydown", handleGlobalKeyDown);
 });
@@ -911,6 +1104,9 @@ onBeforeUnmount(() => {
             <div class="msg-text">{{ message.text }}</div>
 
             <div v-if="message.error" class="msg-error">{{ message.error }}</div>
+            <div v-if="message.role === 'assistant' && message.streamStage" class="msg-meta">
+              阶段：{{ message.streamStage }}
+            </div>
             <div v-if="message.featureCount && message.featureCount > 0" class="msg-meta">
               {{ featureCountText(message) }}
             </div>
@@ -996,9 +1192,10 @@ onBeforeUnmount(() => {
           v-model="question"
           type="text"
           placeholder="例如：鼓楼区公园有多少个"
-          @keyup.enter="runQuery"
+          @keyup.enter="loading ? stopStreaming() : runQuery()"
         />
-        <button :disabled="loading" @click="runQuery">{{ loading ? "发送中" : "发送" }}</button>
+        <button :disabled="loading" @click="runQuery">发送</button>
+        <button v-if="loading" class="danger-btn" @click="stopStreaming">停止</button>
       </div>
     </aside>
 

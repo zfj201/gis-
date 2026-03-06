@@ -65,6 +65,7 @@ export const config = {
     process.env.SEMANTIC_SYNONYMS_PATH ?? "backend/training/semantic-synonyms.json"
   ),
   queryMaxFeatures: Number(process.env.QUERY_MAX_FEATURES ?? 500000),
+  mapHighlightMaxFeatures: Number(process.env.MAP_HIGHLIGHT_MAX_FEATURES ?? 2000),
   queryPageSize: Number(process.env.QUERY_PAGE_SIZE ?? 2000),
   queryMaxPages: Number(process.env.QUERY_MAX_PAGES ?? 2000),
   nearestDefaultK: Number(process.env.NEAREST_DEFAULT_K ?? 1),

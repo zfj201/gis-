@@ -195,6 +195,11 @@
 - 输入：`{ "question": "闽侯县1km内的公园" }`
 - 输出：`parse + execute` 聚合结果，供前端单次渲染。
 
+#### `POST /api/chat/query/stream`
+- 输入：`{ "question": "闽侯县1km内的公园" }`
+- 输出：`text/event-stream`，事件顺序为 `stage -> delta* -> final -> done`。
+- 事件类型：`stage`（阶段通知）、`delta`（增量文本）、`final`（最终完整结果）、`error`（错误）、`done`（completed/aborted/error）。
+
 #### `GET /api/layers/meta`
 - 输出：图层字段、SR、能力信息、可用查询模板。
 

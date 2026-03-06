@@ -135,14 +135,15 @@ DSL 的价值不是“多写一层”，而是解决三个核心矛盾：
 
 ## 5.3 API 核心接口
 1. `POST /api/chat/query`：统一入口（推荐）
-2. `POST /api/semantic/parse`：只做语义解析
-3. `POST /api/spatial/execute`：只做执行
-4. `GET /api/layers/catalog`：图层目录
-5. `POST /api/layers/catalog/register`：注册服务
-6. `PATCH /api/layers/catalog/layer/:layerKey`：显隐/可查询状态
-7. `DELETE /api/layers/catalog/service/:serviceId`：删除服务
-8. `GET /api/layers/meta`：图层元数据
-9. `POST /api/layers/export/features-page`：分页导出查询
+2. `POST /api/chat/query/stream`：SSE 流式入口（stage/delta/final/done）
+3. `POST /api/semantic/parse`：只做语义解析
+4. `POST /api/spatial/execute`：只做执行
+5. `GET /api/layers/catalog`：图层目录
+6. `POST /api/layers/catalog/register`：注册服务
+7. `PATCH /api/layers/catalog/layer/:layerKey`：显隐/可查询状态
+8. `DELETE /api/layers/catalog/service/:serviceId`：删除服务
+9. `GET /api/layers/meta`：图层元数据
+10. `POST /api/layers/export/features-page`：分页导出查询
 
 ## 5.4 扩展响应元数据
 当前增加了执行可观测字段（可选）：
@@ -415,4 +416,3 @@ DSL 的价值不是“多写一层”，而是解决三个核心矛盾：
 
 对毕设而言，这个项目具备了“研究问题明确、技术方案完整、工程实现充分、可演示性强、可继续迭代”的关键条件。  
 后续只要补齐评测体系与研究对比实验，就可以形成一套完整且有说服力的毕业设计成果。
-
