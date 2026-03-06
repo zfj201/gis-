@@ -7,6 +7,7 @@ import { config } from "./config.js";
 import { UserFacingError } from "./errors.js";
 import { executeArcgisQuery } from "./arcgis.js";
 import { layerRegistry } from "./layer-registry.js";
+import { normalizeDistancesMeters, normalizeRadiusMeters } from "./spatial-distance.js";
 
 interface ArcgisFeatureLike {
   geometry?: Record<string, unknown>;
@@ -766,7 +767,8 @@ async function executeSourceBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutio
 
   const merged = mergeSourceGeometry(sourceLayer.geometryType, sourceFeatures);
 
-  const radius = dsl.spatialFilter?.radius ?? config.defaultRadiusMeters;
+  // 统一换算为米，避免 kilometer 被误按 meter 执行。
+  const radius = normalizeRadiusMeters(dsl.spatialFilter?.radius, dsl.spatialFilter?.unit) ?? config.defaultRadiusMeters;
   if (config.maxRadiusMeters > 0 && radius > config.maxRadiusMeters) {
     throw new UserFacingError(`查询半径超过上限 ${config.maxRadiusMeters} 米，请缩小半径后重试。`);
   }
@@ -990,9 +992,7 @@ async function executeSpatialJoinCountDsl(dsl: SpatialQueryDSL): Promise<DslExec
 async function executeMultiRingBufferDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResult> {
   const radii = Array.from(
     new Set(
-      (dsl.spatialFilter?.distances ?? [])
-        .map((item) => Math.round(item))
-        .filter((item) => Number.isFinite(item) && item > 0)
+      normalizeDistancesMeters(dsl.spatialFilter?.distances, dsl.spatialFilter?.unit)
     )
   ).sort((a, b) => a - b);
 
@@ -1249,7 +1249,7 @@ async function executeNearestDsl(dsl: SpatialQueryDSL): Promise<DslExecutionResu
 
   const topK = normalizeNearestLimit(dsl.limit);
   const requestedLimit = dsl.limit > config.nearestMaxK ? config.nearestMaxK : topK;
-  const requestedWithin = dsl.spatialFilter?.radius;
+  const requestedWithin = normalizeRadiusMeters(dsl.spatialFilter?.radius, dsl.spatialFilter?.unit);
   const initialRadius = Math.max(
     10,
     normalizePositiveInt(Math.min(requestedWithin ?? config.nearestInitialRadiusMeters, config.nearestInitialRadiusMeters), 500)

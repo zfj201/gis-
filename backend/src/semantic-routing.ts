@@ -14,17 +14,75 @@ function containsKeyword(text: string, pattern: RegExp): boolean {
   return pattern.test(text);
 }
 
+function normalizeForMatch(value: string): string {
+  return value.toLowerCase().replace(/[_\-\s/\\|:;()（）【】\[\]]+/g, "");
+}
+
+function splitLayerTokens(raw: string): string[] {
+  const base = raw.trim();
+  if (!base) {
+    return [];
+  }
+  const tokens = new Set<string>();
+  const coarse = base
+    .split(/[_\-\s,/\\|:;()（）【】\[\]]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const token of coarse) {
+    if (token.length >= 2) {
+      tokens.add(token);
+    }
+  }
+  const zhMatches = base.match(/[\u4e00-\u9fa5]{2,}/g) ?? [];
+  for (const token of zhMatches) {
+    tokens.add(token);
+  }
+  const enMatches = base.match(/[a-zA-Z][a-zA-Z0-9]{2,}/g) ?? [];
+  for (const token of enMatches) {
+    tokens.add(token);
+  }
+  return Array.from(tokens);
+}
+
 function scoreLayerByQuestion(layer: LayerDescriptor, question: string): number {
   const lowerQuestion = question.toLowerCase();
+  const normalizedQuestion = normalizeForMatch(question);
   let score = 0;
 
   if (lowerQuestion.includes(layer.name.toLowerCase())) {
     score += 8;
   }
+  if (normalizeForMatch(layer.name) && normalizedQuestion.includes(normalizeForMatch(layer.name))) {
+    score += 4;
+  }
+  for (const token of splitLayerTokens(layer.name)) {
+    if (normalizeForMatch(token) && normalizedQuestion.includes(normalizeForMatch(token))) {
+      score += 2;
+      break;
+    }
+  }
+  for (const token of layer.semanticProfile?.tokens ?? []) {
+    if (!token.trim()) {
+      continue;
+    }
+    if (normalizedQuestion.includes(normalizeForMatch(token))) {
+      score += 2.6;
+      break;
+    }
+  }
 
   for (const alias of layer.aliases) {
     if (alias && lowerQuestion.includes(alias.toLowerCase())) {
       score += 5;
+    }
+    if (alias && normalizeForMatch(alias) && normalizedQuestion.includes(normalizeForMatch(alias))) {
+      score += 3;
+    }
+    for (const token of splitLayerTokens(alias)) {
+      if (normalizeForMatch(token) && normalizedQuestion.includes(normalizeForMatch(token))) {
+        score += 1.8;
+        break;
+      }
     }
   }
 

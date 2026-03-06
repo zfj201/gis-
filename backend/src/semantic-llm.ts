@@ -1,5 +1,6 @@
 import {
   type FilterExprNode,
+  type LayerDescriptor,
   type ParseResponse,
   type ParserSource,
   type SpatialQueryDSL,
@@ -26,6 +27,7 @@ import {
 } from "./spatial-intent-gate.js";
 import { buildSemanticPromptContext } from "./semantic-context-builder.js";
 import { appendSemanticFailureRecord } from "./semantic-retrieval.js";
+import { rankSemanticCandidates, type SemanticCandidateLabel } from "./semantic-candidate-ranker.js";
 
 interface LlmSemanticOutput {
   actionable: boolean;
@@ -81,6 +83,10 @@ interface SemanticMetaPayload {
   modelAttempts: number;
   repaired: boolean;
   decisionPath: string;
+  gateDecision?: SpatialGateDecision;
+  candidateCount?: number;
+  chosenCandidate?: "model" | "rule" | "repaired_model";
+  candidateScore?: number;
 }
 
 class SemanticOutputError extends Error {
@@ -1102,7 +1108,13 @@ function withSemanticMeta(parsed: ParseResponse, meta: Partial<SemanticMetaPaylo
       retrievalHits: typeof meta.retrievalHits === "number" ? meta.retrievalHits : prev.retrievalHits,
       modelAttempts: typeof meta.modelAttempts === "number" ? meta.modelAttempts : prev.modelAttempts,
       repaired: typeof meta.repaired === "boolean" ? meta.repaired : prev.repaired,
-      decisionPath: meta.decisionPath ?? prev.decisionPath
+      decisionPath: meta.decisionPath ?? prev.decisionPath,
+      gateDecision: meta.gateDecision ?? prev.gateDecision,
+      candidateCount:
+        typeof meta.candidateCount === "number" ? meta.candidateCount : prev.candidateCount,
+      chosenCandidate: meta.chosenCandidate ?? prev.chosenCandidate,
+      candidateScore:
+        typeof meta.candidateScore === "number" ? meta.candidateScore : prev.candidateScore
     }
   };
 }
@@ -1302,6 +1314,64 @@ function parseSemanticOutputToDsl(
   return parsed;
 }
 
+function buildLowConfidenceFollowUp(bestScore: number): string {
+  return `当前语义解析置信度较低（score=${bestScore.toFixed(1)}），为避免误查，请补充更明确的图层、字段或条件。`;
+}
+
+function applyCandidateRanking(
+  question: string,
+  queryableLayers: LayerDescriptor[],
+  modelParsed: ParseResponse,
+  modelLabel: SemanticCandidateLabel,
+  contextMeta: {
+    retrievalHits: number;
+    modelAttempts: number;
+    repaired: boolean;
+    decisionPath: string;
+    gateDecision: SpatialGateDecision;
+  }
+): ParseResponse {
+  const ruleParsed = withParserSource(parseQuestionByRules(question), "rule");
+  const ranked = rankSemanticCandidates(
+    question,
+    [
+      { label: modelLabel, parsed: modelParsed },
+      { label: "rule", parsed: ruleParsed }
+    ],
+    queryableLayers
+  );
+  const best = ranked[0];
+  const rankedMeta = {
+    retrievalHits: contextMeta.retrievalHits,
+    modelAttempts: contextMeta.modelAttempts,
+    repaired: contextMeta.repaired,
+    decisionPath: contextMeta.decisionPath,
+    candidateCount: ranked.length,
+    chosenCandidate: best.label,
+    candidateScore: best.score,
+    gateDecision: contextMeta.gateDecision
+  } as const;
+
+  const bestWithMeta = withSemanticMeta(best.parsed, rankedMeta);
+  if (best.score >= 75) {
+    return bestWithMeta;
+  }
+
+  return withSemanticMeta(
+    {
+      ...bestWithMeta,
+      followUpQuestion: bestWithMeta.followUpQuestion ?? buildLowConfidenceFollowUp(best.score),
+      semanticWarnings: Array.from(
+        new Set([
+          ...(bestWithMeta.semanticWarnings ?? []),
+          `候选评分偏低(${best.score.toFixed(1)})，已进入澄清流程`
+        ])
+      )
+    },
+    rankedMeta
+  );
+}
+
 async function parseWithOpenAICompatible(
   question: string,
   provider: OpenAICompatibleConfig,
@@ -1330,6 +1400,7 @@ async function parseWithOpenAICompatible(
   const baseMessages = buildSemanticMessages(semanticSystemPrompt, semanticFewShots, question);
   const deadlineAt = options?.deadlineAt ?? Date.now() + 55_000;
   const maxRepairRetry = Math.max(0, config.semanticModelRepairMaxRetry);
+  const gateDecision = computeSpatialGate(question).decision;
   let modelAttempts = 0;
   let repaired = false;
   const first = await requestSemanticCompletion(provider, baseMessages, true, deadlineAt);
@@ -1337,11 +1408,12 @@ async function parseWithOpenAICompatible(
 
   try {
     const parsed = parseSemanticOutputToDsl(question, provider.parserSource, first.content);
-    return withSemanticMeta(parsed, {
+    return applyCandidateRanking(question, queryableLayers, parsed, "model", {
       retrievalHits: context.retrievalHits,
       modelAttempts,
       repaired,
-      decisionPath: provider.parserSource
+      decisionPath: provider.parserSource,
+      gateDecision
     });
   } catch (error) {
     if (!isRepairableSemanticError(error)) {
@@ -1375,11 +1447,12 @@ async function parseWithOpenAICompatible(
 
       try {
         const parsed = parseSemanticOutputToDsl(question, provider.parserSource, repairedCompletion.content);
-        return withSemanticMeta(parsed, {
+        return applyCandidateRanking(question, queryableLayers, parsed, "repaired_model", {
           retrievalHits: context.retrievalHits,
           modelAttempts,
           repaired,
-          decisionPath: `${provider.parserSource}:repair`
+          decisionPath: `${provider.parserSource}:repair`,
+          gateDecision
         });
       } catch (repairError) {
         if (!isRepairableSemanticError(repairError)) {
@@ -1568,6 +1641,7 @@ export async function parseQuestionSmart(
   question: string,
   options?: { assumeSpatial?: boolean }
 ): Promise<ParseResponse> {
+  const gateFallbackDecision = computeSpatialGate(question).decision;
   if (!options?.assumeSpatial) {
     const gateDecision = await detectSpatialIntentDecision(question);
     console.info("[semantic-gate] decision", {
@@ -1581,7 +1655,8 @@ export async function parseQuestionSmart(
         retrievalHits: 0,
         modelAttempts: 0,
         repaired: false,
-        decisionPath: "gate_non_spatial"
+        decisionPath: "gate_non_spatial",
+        gateDecision: gateDecision.gateDecision
       });
     }
   }
@@ -1592,7 +1667,8 @@ export async function parseQuestionSmart(
       retrievalHits: 0,
       modelAttempts: 0,
       repaired: false,
-      decisionPath: "rule_direct"
+      decisionPath: "rule_direct",
+      gateDecision: gateFallbackDecision
     });
   }
 
@@ -1600,7 +1676,8 @@ export async function parseQuestionSmart(
     try {
       const parsed = await parseWithGeminiThenOpenRouter(question);
       return withSemanticMeta(parsed, {
-        decisionPath: parsed.semanticMeta?.decisionPath ?? "gemini"
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "gemini",
+        gateDecision: parsed.semanticMeta?.gateDecision ?? gateFallbackDecision
       });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
@@ -1626,7 +1703,8 @@ export async function parseQuestionSmart(
           retrievalHits: 0,
           modelAttempts: 0,
           repaired: false,
-          decisionPath: "gemini->openrouter->rule_fallback"
+          decisionPath: "gemini->openrouter->rule_fallback",
+          gateDecision: gateFallbackDecision
         }),
         parserFailureReason: reason,
         parserFailureDetail: detail
@@ -1646,7 +1724,8 @@ export async function parseQuestionSmart(
         maxAttempts: 3
       });
       return withSemanticMeta(parsed, {
-        decisionPath: parsed.semanticMeta?.decisionPath ?? "groq"
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "groq",
+        gateDecision: parsed.semanticMeta?.gateDecision ?? gateFallbackDecision
       });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
@@ -1672,7 +1751,8 @@ export async function parseQuestionSmart(
           retrievalHits: 0,
           modelAttempts: 0,
           repaired: false,
-          decisionPath: "groq->rule_fallback"
+          decisionPath: "groq->rule_fallback",
+          gateDecision: gateFallbackDecision
         }),
         parserFailureReason: reason,
         parserFailureDetail: detail
@@ -1684,7 +1764,8 @@ export async function parseQuestionSmart(
     try {
       const parsed = await parseWithOpenRouterCandidates(question);
       return withSemanticMeta(parsed, {
-        decisionPath: parsed.semanticMeta?.decisionPath ?? "openrouter"
+        decisionPath: parsed.semanticMeta?.decisionPath ?? "openrouter",
+        gateDecision: parsed.semanticMeta?.gateDecision ?? gateFallbackDecision
       });
     } catch (error) {
       const reason = classifyModelFailureReason(error);
@@ -1710,7 +1791,8 @@ export async function parseQuestionSmart(
           retrievalHits: 0,
           modelAttempts: 0,
           repaired: false,
-          decisionPath: "openrouter->rule_fallback"
+          decisionPath: "openrouter->rule_fallback",
+          gateDecision: gateFallbackDecision
         }),
         parserFailureReason: reason,
         parserFailureDetail: detail
@@ -1723,7 +1805,8 @@ export async function parseQuestionSmart(
     retrievalHits: 0,
     modelAttempts: 0,
     repaired: false,
-    decisionPath: "unknown_provider->rule"
+    decisionPath: "unknown_provider->rule",
+    gateDecision: gateFallbackDecision
   });
 }
 

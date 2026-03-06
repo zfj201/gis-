@@ -2,6 +2,8 @@ import type { FilterExprNode, SpatialQueryDSL } from "@gis/shared";
 import type { LayerDescriptor } from "@gis/shared";
 import { UserFacingError } from "./errors.js";
 import { layerRegistry } from "./layer-registry.js";
+import { cleanCollectionValue, trimLayerEntityTailByField } from "./semantic-slot-parser.js";
+import { normalizeDistancesMeters, normalizeRadiusMeters } from "./spatial-distance.js";
 
 type FilterOperator = SpatialQueryDSL["attributeFilter"][number]["operator"];
 
@@ -63,17 +65,6 @@ function cleanValue(value: string): string {
     }
   }
   next = next.replace(/[的]+$/g, "").trim();
-  return next;
-}
-
-function cleanCollectionValue(value: string): string {
-  let next = cleanValue(value);
-  // Handle Chinese postpositions that are often attached to IN/NOT IN tails, e.g. "45854、45855中".
-  next = next
-    .replace(/(?:之)?中$/g, "")
-    .replace(/里$/g, "")
-    .replace(/内$/g, "")
-    .trim();
   return next;
 }
 
@@ -363,8 +354,12 @@ function normalizeExprNode(
     if (!cleanedValue) {
       return null;
     }
+    const fieldAwareValue = trimLayerEntityTailByField(cleanedValue, resolvedField, layer);
+    if (!fieldAwareValue) {
+      return null;
+    }
     if (expr.operator === "like") {
-      const normalizedLike = normalizeLikeValue(cleanedValue);
+      const normalizedLike = normalizeLikeValue(fieldAwareValue);
       if (!normalizedLike) {
         return null;
       }
@@ -377,7 +372,7 @@ function normalizeExprNode(
     return {
       ...expr,
       field: resolvedField,
-      value: cleanedValue
+      value: fieldAwareValue
     };
   }
 
@@ -506,6 +501,45 @@ function hasCoordinateHint(question: string): boolean {
   );
 }
 
+function parseDistanceListMetersFromQuestion(question: string): number[] {
+  const rawMatches = Array.from(question.matchAll(/(\d+(?:\.\d+)?)\s*(km|公里|千米|m|米)/gi));
+  if (rawMatches.length === 0) {
+    return [];
+  }
+  return rawMatches
+    .map((match) => normalizeRadiusMeters(Number(match[1]), /(km|公里|千米)/i.test(match[2]) ? "kilometer" : "meter"))
+    .filter((item): item is number => typeof item === "number" && item > 0);
+}
+
+function normalizeSpatialDistanceByQuestion(question: string, dsl: SpatialQueryDSL): SpatialQueryDSL {
+  if (!dsl.spatialFilter) {
+    return dsl;
+  }
+  const isDistanceIntent = dsl.intent === "buffer_search" || dsl.intent === "nearest" || dsl.spatialFilter.type === "buffer";
+  if (!isDistanceIntent) {
+    return dsl;
+  }
+
+  const distanceList = parseDistanceListMetersFromQuestion(question);
+  if (distanceList.length === 0) {
+    return dsl;
+  }
+
+  const normalizedDistances = normalizeDistancesMeters(distanceList, "meter");
+  const nextSpatialFilter = { ...dsl.spatialFilter };
+  if (Array.isArray(nextSpatialFilter.distances) && nextSpatialFilter.distances.length > 0 && normalizedDistances.length >= 2) {
+    nextSpatialFilter.distances = normalizedDistances;
+    nextSpatialFilter.unit = "meter";
+  }
+  nextSpatialFilter.radius = normalizedDistances[0];
+  nextSpatialFilter.unit = "meter";
+
+  return {
+    ...dsl,
+    spatialFilter: nextSpatialFilter
+  };
+}
+
 function extractNearestTargetPart(question: string): string | null {
   const match = question.trim().match(/(.+?)\s*(?:最近的?|nearest)\s*(.+)/i);
   if (!match?.[2]) {
@@ -596,7 +630,9 @@ function normalizeFilterValues(
   question: string,
   layer: LayerDescriptor
 ): SpatialQueryDSL {
-  const nearestSafeDsl = normalizeNearestFiltersByQuestion(question, dsl, layer);
+  // 优先根据问句显式单位矫正半径，确保“公里/米”语义稳定。
+  const distanceSafeDsl = normalizeSpatialDistanceByQuestion(question, dsl);
+  const nearestSafeDsl = normalizeNearestFiltersByQuestion(question, distanceSafeDsl, layer);
   const allowedFields = new Set(layer.fields.filter((field) => field.queryable).map((field) => field.name));
   const nameLikeFields = new Set(
     layer.fields

@@ -83,3 +83,42 @@ export async function queryArcgisLayer(
 
   return payload;
 }
+
+export async function queryDistinctFieldValues(
+  layerUrl: string,
+  fieldName: string,
+  limit = 20
+): Promise<string[]> {
+  const safeLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+  const payload = await queryArcgisLayer(layerUrl, {
+    f: "pjson",
+    where: "1=1",
+    outFields: fieldName,
+    returnGeometry: "false",
+    returnDistinctValues: "true",
+    orderByFields: `${fieldName} asc`,
+    resultRecordCount: String(safeLimit)
+  });
+  const features = Array.isArray((payload as { features?: unknown[] }).features)
+    ? ((payload as { features?: Array<{ attributes?: Record<string, unknown> }> }).features ?? [])
+    : [];
+  const values: string[] = [];
+  const seen = new Set<string>();
+  for (const feature of features) {
+    const raw = feature.attributes?.[fieldName];
+    const value = String(raw ?? "").trim();
+    if (!value) {
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    values.push(value);
+    if (values.length >= safeLimit) {
+      break;
+    }
+  }
+  return values;
+}

@@ -12,6 +12,7 @@ export interface SpatialIntentGateResult {
 const LOW_THRESHOLD = 2;
 const HIGH_THRESHOLD = 5;
 const MAX_MATCHED_SIGNALS = 12;
+const UNCERTAIN_UPLIFT_SCORE = 3.1;
 
 const spatialActionSignals: Array<{ pattern: RegExp; score: number; reason: string }> = [
   {
@@ -40,7 +41,7 @@ const spatialActionSignals: Array<{ pattern: RegExp; score: number; reason: stri
     reason: "属性分析词命中"
   },
   {
-    pattern: /(公园|道路|街巷|门牌|地址|宗地|院落|地块|房屋|建筑|单元楼|图层|要素)/i,
+    pattern: /(公园|道路|街巷|门牌|地址|宗地|院落|地块|房屋|建筑|单元楼|村落|村庄|图层|要素)/i,
     score: 2.8,
     reason: "空间实体词命中"
   },
@@ -70,7 +71,7 @@ function geometryHintWords(layer: LayerDescriptor): string[] {
 }
 
 function isSemanticFieldToken(token: string): boolean {
-  return /(objectid|fid|shape__area|shape__length|面积|长度|周长|名称|标准名称|地址|标准地址|门牌|区县|行政|城市|乡镇|编号)/i.test(
+  return /(?:objectid|fid|shape__area|shape__length|面积|长度|周长|名称|标准名称|地址|标准地址|门牌|区县|行政|城市|乡镇|编号|county|district|city|town|village)/i.test(
     token
   );
 }
@@ -87,6 +88,50 @@ function shouldUseToken(token: string): boolean {
     return false;
   }
   return true;
+}
+
+function splitLayerTokens(raw: string): string[] {
+  const base = raw.trim();
+  if (!base) {
+    return [];
+  }
+
+  const tokens = new Set<string>();
+  const coarse = base
+    .split(/[_\-\s,/\\|:;()（）【】\[\]]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const token of coarse) {
+    if (shouldUseToken(token)) {
+      tokens.add(token);
+    }
+  }
+
+  const zhMatches = base.match(/[\u4e00-\u9fa5]{2,}/g) ?? [];
+  for (const token of zhMatches) {
+    if (shouldUseToken(token)) {
+      tokens.add(token);
+    }
+  }
+
+  const enMatches = base.match(/[a-zA-Z][a-zA-Z0-9]{2,}/g) ?? [];
+  for (const token of enMatches) {
+    if (shouldUseToken(token)) {
+      tokens.add(token);
+    }
+  }
+
+  return Array.from(tokens);
+}
+
+function fieldRoleWeight(role: string | undefined): number {
+  if (role === "admin" || role === "name" || role === "id") {
+    return 2.2;
+  }
+  if (role === "address" || role === "measure" || role === "category") {
+    return 1.4;
+  }
+  return 0.8;
 }
 
 function addWeightedSignal(
@@ -111,6 +156,9 @@ export function evaluateSpatialIntentGate(
   const reasons: string[] = [];
   const matchedSignals: string[] = [];
   const matchedWeights = new Map<string, number>();
+  const hasActionSignal = /(查询|检索|查找|筛选|列出|显示|统计|分组|汇总|多少|几个|数量|总数)/i.test(question);
+  let hasLayerTokenHit = false;
+  let hasFieldSignalHit = false;
 
   const pushReason = (text: string): void => {
     if (!reasons.includes(text)) {
@@ -141,14 +189,47 @@ export function evaluateSpatialIntentGate(
 
   const queryableLayers = layers.filter((layer) => layer.queryable);
   for (const layer of queryableLayers) {
+    const profileTokens = layer.semanticProfile?.tokens?.filter(shouldUseToken) ?? [];
+    const roleMap = layer.semanticProfile?.fieldRoles ?? {};
     const layerName = layer.name.trim();
     if (shouldUseToken(layerName) && compactQuestion.includes(normalizeText(layerName))) {
       const delta = addWeightedSignal(matchedWeights, `layer:${layerName}`, 2.8);
       if (delta > 0) {
         score += delta;
+        hasLayerTokenHit = true;
         pushReason(`命中图层名 ${layerName}`);
         pushSignal(`图层:${layerName}`);
       }
+    }
+    let layerTokenHit = 0;
+    for (const token of splitLayerTokens(layerName)) {
+      if (!compactQuestion.includes(normalizeText(token))) {
+        continue;
+      }
+      const delta = addWeightedSignal(matchedWeights, `layer-token:${layerName}:${token}`, 1.6);
+      if (delta > 0) {
+        score += delta;
+        layerTokenHit += 1;
+        hasLayerTokenHit = true;
+        pushReason(`命中图层词元 ${token}`);
+        pushSignal(`图层词元:${token}`);
+      }
+      if (layerTokenHit >= 2) {
+        break;
+      }
+    }
+    for (const token of profileTokens) {
+      if (!compactQuestion.includes(normalizeText(token))) {
+        continue;
+      }
+      const delta = addWeightedSignal(matchedWeights, `profile-token:${layer.layerKey}:${token}`, 2.1);
+      if (delta > 0) {
+        score += delta;
+        hasLayerTokenHit = true;
+        pushReason(`命中画像词元 ${token}`);
+        pushSignal(`画像词元:${token}`);
+      }
+      break;
     }
 
     for (const alias of layer.aliases) {
@@ -161,8 +242,27 @@ export function evaluateSpatialIntentGate(
       const delta = addWeightedSignal(matchedWeights, `alias:${alias}`, 1.8);
       if (delta > 0) {
         score += delta;
+        hasLayerTokenHit = true;
         pushReason(`命中图层别名 ${alias}`);
         pushSignal(`别名:${alias}`);
+      }
+
+      let aliasTokenHit = 0;
+      for (const token of splitLayerTokens(alias)) {
+        if (!compactQuestion.includes(normalizeText(token))) {
+          continue;
+        }
+        const tokenDelta = addWeightedSignal(matchedWeights, `alias-token:${alias}:${token}`, 1.5);
+        if (tokenDelta > 0) {
+          score += tokenDelta;
+          aliasTokenHit += 1;
+          hasLayerTokenHit = true;
+          pushReason(`命中别名词元 ${token}`);
+          pushSignal(`别名词元:${token}`);
+        }
+        if (aliasTokenHit >= 2) {
+          break;
+        }
       }
     }
 
@@ -204,10 +304,11 @@ export function evaluateSpatialIntentGate(
         semanticBoostFields.has(alias.toLowerCase()) ||
         isSemanticFieldToken(name) ||
         isSemanticFieldToken(alias);
-      const weight = isSemantic ? 2 : 0.7;
+      const weight = Math.max(isSemantic ? 2 : 0.7, fieldRoleWeight(roleMap[name]));
       const delta = addWeightedSignal(matchedWeights, `field:${name}`, weight);
       if (delta > 0) {
         score += delta;
+        hasFieldSignalHit = true;
         pushReason(`命中字段 ${name}`);
         pushSignal(`字段:${name}`);
       }
@@ -215,15 +316,22 @@ export function evaluateSpatialIntentGate(
   }
 
   const roundedScore = Math.round(score * 10) / 10;
-  const decision: SpatialGateDecision =
+  let decision: SpatialGateDecision =
     roundedScore >= HIGH_THRESHOLD
       ? "spatial"
       : roundedScore <= LOW_THRESHOLD
         ? "non_spatial"
         : "uncertain";
+  let finalScore = roundedScore;
+  if (decision === "non_spatial" && hasActionSignal && hasLayerTokenHit && hasFieldSignalHit) {
+    finalScore = Math.max(finalScore, UNCERTAIN_UPLIFT_SCORE);
+    decision = "uncertain";
+    pushReason("低分命中字段+图层+动作词，提升为 uncertain");
+    pushSignal("低分提升:uncertain");
+  }
 
   return {
-    score: roundedScore,
+    score: finalScore,
     decision,
     reasons,
     matchedSignals

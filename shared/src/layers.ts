@@ -1,5 +1,23 @@
 import { z } from "zod";
 
+export const semanticFieldRoleSchema = z.enum([
+  "id",
+  "name",
+  "admin",
+  "address",
+  "measure",
+  "category",
+  "unknown"
+]);
+
+export const layerSemanticProfileSchema = z.object({
+  tokens: z.array(z.string().min(1)).default([]),
+  fieldRoles: z.record(z.string().min(1), semanticFieldRoleSchema).default({}),
+  adminFields: z.array(z.string().min(1)).default([]),
+  nameFields: z.array(z.string().min(1)).default([]),
+  valueHints: z.record(z.string().min(1), z.array(z.string().min(1)).max(20)).optional()
+});
+
 export const layerFieldSchema = z.object({
   name: z.string().min(1),
   alias: z.string().min(1),
@@ -28,7 +46,8 @@ export const layerDescriptorSchema = z.object({
   visibleByDefault: z.boolean().default(true),
   pointRenderMode: z.enum(["default", "heatmap"]).optional(),
   queryable: z.boolean().default(true),
-  aliases: z.array(z.string().min(1)).default([])
+  aliases: z.array(z.string().min(1)).default([]),
+  semanticProfile: layerSemanticProfileSchema.optional()
 });
 
 export const layerCatalogResponseSchema = z.object({
@@ -37,6 +56,8 @@ export const layerCatalogResponseSchema = z.object({
 });
 
 export type LayerField = z.infer<typeof layerFieldSchema>;
+export type SemanticFieldRole = z.infer<typeof semanticFieldRoleSchema>;
+export type LayerSemanticProfile = z.infer<typeof layerSemanticProfileSchema>;
 export type LayerServiceDescriptor = z.infer<typeof layerServiceDescriptorSchema>;
 export type LayerDescriptor = z.infer<typeof layerDescriptorSchema>;
 export type LayerCatalogResponse = z.infer<typeof layerCatalogResponseSchema>;

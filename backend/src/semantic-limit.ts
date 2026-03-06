@@ -89,7 +89,10 @@ export function parseChineseNumeral(raw: string): number | undefined {
 }
 
 function parseCountToken(raw: string): number | undefined {
-  const token = raw.trim();
+  // 兼容全角数字，避免“前５个”解析失败。
+  const token = raw
+    .trim()
+    .replace(/[０-９]/g, (ch) => String(ch.charCodeAt(0) - "０".charCodeAt(0)));
   if (!token) {
     return undefined;
   }
@@ -100,24 +103,38 @@ function parseCountToken(raw: string): number | undefined {
   return parseChineseNumeral(token);
 }
 
-const topPhrasePattern = /前\s*([零一二两三四五六七八九十百千万\d]+)\s*(个|条|家|所|项|座|处)?/i;
+const countTokenPattern = "([零一二两三四五六七八九十百千万\\d０-９]+)";
+const countUnitPattern = "(个|条|家|所|项|座|处)?";
+
+// “前N”与“最近的N个”都视为显式 TopN。
+const topPhrasePatterns = [
+  new RegExp(`前\\s*${countTokenPattern}\\s*${countUnitPattern}`, "i"),
+  new RegExp(`最近(?:的)?\\s*${countTokenPattern}\\s*${countUnitPattern}`, "i"),
+  new RegExp(`${countTokenPattern}\\s*${countUnitPattern}\\s*最近(?:的)?`, "i")
+];
 
 export function parseTopLimitFromQuestion(question: string, cap: number): number | undefined {
-  const match = question.match(topPhrasePattern);
-  if (!match?.[1]) {
-    return undefined;
+  for (const pattern of topPhrasePatterns) {
+    const match = question.match(pattern);
+    if (!match?.[1]) {
+      continue;
+    }
+    const parsed = parseCountToken(match[1]);
+    if (parsed === undefined || !Number.isFinite(parsed) || parsed < 1) {
+      continue;
+    }
+    return Math.min(Math.round(parsed), Math.max(1, cap));
   }
-  const parsed = parseCountToken(match[1]);
-  if (parsed === undefined || !Number.isFinite(parsed) || parsed < 1) {
-    return undefined;
-  }
-  return Math.min(Math.round(parsed), Math.max(1, cap));
+  return undefined;
 }
 
 export function stripTopLimitPhrase(text: string): string {
-  return text
-    .replace(new RegExp(`^\\s*${topPhrasePattern.source}\\s*`, "i"), "")
-    .replace(new RegExp(`\\s*${topPhrasePattern.source}\\s*$`, "i"), "")
-    .trim();
+  let next = text.trim();
+  for (const pattern of topPhrasePatterns) {
+    next = next
+      .replace(new RegExp(`^\\s*${pattern.source}\\s*`, "i"), "")
+      .replace(new RegExp(`\\s*${pattern.source}\\s*$`, "i"), "")
+      .trim();
+  }
+  return next;
 }
-

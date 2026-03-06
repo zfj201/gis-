@@ -159,6 +159,10 @@ export interface ParseResponse {
     modelAttempts: number;
     repaired: boolean;
     decisionPath: string;
+    gateDecision?: "spatial" | "non_spatial" | "uncertain";
+    candidateCount?: number;
+    chosenCandidate?: "model" | "rule" | "repaired_model";
+    candidateScore?: number;
   };
 }
 
@@ -228,5 +232,9 @@ export interface ExecuteResponse {
     modelAttempts: number;
     repaired: boolean;
     decisionPath: string;
+    gateDecision?: "spatial" | "non_spatial" | "uncertain";
+    candidateCount?: number;
+    chosenCandidate?: "model" | "rule" | "repaired_model";
+    candidateScore?: number;
   };
 }

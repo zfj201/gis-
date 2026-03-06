@@ -2,7 +2,9 @@ import type { FilterExprNode, QueryPlan, SpatialQueryDSL } from "@gis/shared";
 import { config } from "./config.js";
 import { UserFacingError } from "./errors.js";
 import { layerRegistry } from "./layer-registry.js";
+import { cleanCollectionValue } from "./semantic-slot-parser.js";
 import { defaultOutputFields } from "./semantic-routing.js";
+import { normalizeRadiusMeters } from "./spatial-distance.js";
 
 function escapeSql(value: string): string {
   return value.replace(/'/g, "''");
@@ -20,15 +22,8 @@ function normalizeLikeValue(value: string): string {
 }
 
 function splitListValues(rawValue: string): string[] {
-  const normalizeToken = (token: string): string =>
-    token
-      .trim()
-      .replace(/^[“"'`]+|[”"'`]+$/g, "")
-      // Tolerate natural-language tails in collection filters, e.g. "45855中".
-      .replace(/(?:之)?中$/g, "")
-      .replace(/里$/g, "")
-      .replace(/内$/g, "")
-      .trim();
+  // 集合值在编译阶段再做一次清洗，避免语义层漏网的尾巴词进入 SQL。
+  const normalizeToken = (token: string): string => cleanCollectionValue(token);
 
   return rawValue
     .trim()
@@ -357,7 +352,8 @@ export function compileQueryPlan(dsl: SpatialQueryDSL): QueryPlan {
   if (dsl.spatialFilter?.type === "buffer") {
     const center = dsl.spatialFilter.center;
     if (center) {
-      const radius = dsl.spatialFilter.radius ?? config.defaultRadiusMeters;
+      // 统一将 DSL 中 kilometer/meter 归一到米，避免“输入公里按米执行”。
+      const radius = normalizeRadiusMeters(dsl.spatialFilter.radius, dsl.spatialFilter.unit) ?? config.defaultRadiusMeters;
       if (config.maxRadiusMeters > 0 && radius > config.maxRadiusMeters) {
         throw new Error(`查询半径超限，最大允许 ${config.maxRadiusMeters} 米`);
       }

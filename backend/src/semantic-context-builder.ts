@@ -99,7 +99,8 @@ function toFewShotMessages(
 
 function buildRetrievalSystemHint(
   examples: RetrievedSemanticExample[],
-  failureHints: string[]
+  failureHints: string[],
+  layers: LayerDescriptor[]
 ): string {
   const lines: string[] = [];
   if (examples.length > 0) {
@@ -118,6 +119,27 @@ function buildRetrievalSystemHint(
       lines.push(`- ${hint}`);
     }
   }
+  const profileLines: string[] = [];
+  for (const layer of layers.slice(0, 8)) {
+    const profile = layer.semanticProfile;
+    if (!profile) {
+      continue;
+    }
+    const admin = profile.adminFields.slice(0, 3).join(",") || "-";
+    const names = profile.nameFields.slice(0, 3).join(",") || "-";
+    // valueHints 只取少量样本，避免提示词长度失控。
+    const hintPreview = Object.entries(profile.valueHints ?? {})
+      .slice(0, 2)
+      .map(([fieldName, values]) => `${fieldName}=[${values.slice(0, 5).join(",")}]`)
+      .join("; ");
+    profileLines.push(
+      `- ${layer.name}[${layer.layerKey}] roles(admin=${admin}; name=${names}); tokens=${profile.tokens.slice(0, 6).join(",")}${hintPreview ? `; valueHints=${hintPreview}` : ""}`
+    );
+  }
+  if (profileLines.length > 0) {
+    lines.push("【图层语义画像】");
+    lines.push(...profileLines);
+  }
   return lines.join("\n").trim();
 }
 
@@ -134,11 +156,9 @@ export async function buildSemanticPromptContext(
     options.layers,
     options.defaultLayerKey
   );
-  const retrievalSystemHint = buildRetrievalSystemHint(retrieved.hits, failureHints);
   return {
     retrievalHits: retrieved.hits.length,
     retrievalFewShots,
-    retrievalSystemHint
+    retrievalSystemHint: buildRetrievalSystemHint(retrieved.hits, failureHints, options.layers)
   };
 }
-

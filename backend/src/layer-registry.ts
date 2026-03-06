@@ -1,8 +1,16 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import type { LayerCatalogResponse, LayerDescriptor, LayerField, LayerServiceDescriptor } from "@gis/shared";
+import type {
+  LayerCatalogResponse,
+  LayerDescriptor,
+  LayerField,
+  LayerSemanticProfile,
+  LayerServiceDescriptor,
+  SemanticFieldRole
+} from "@gis/shared";
 import { config } from "./config.js";
+import { queryDistinctFieldValues } from "./arcgis.js";
 import { UserFacingError } from "./errors.js";
 
 interface RegistryState extends LayerCatalogResponse {
@@ -36,6 +44,9 @@ interface ArcgisServiceMetaLike {
   spatialReference?: Record<string, unknown>;
   serviceDescription?: string;
 }
+
+const MAX_SEMANTIC_HINT_FIELDS = 2;
+const MAX_SEMANTIC_HINT_VALUES = 20;
 
 function isQueryableFieldType(type: string): boolean {
   return ![
@@ -139,6 +150,122 @@ function uniqueValues(values: string[]): string[] {
   return result;
 }
 
+function normalizeSemanticToken(text: string): string {
+  return text.toLowerCase().replace(/[_\-\s,/\\|:;()（）【】\[\]]+/g, "");
+}
+
+function splitSemanticTokens(values: string[]): string[] {
+  const tokens = new Set<string>();
+  for (const value of values) {
+    const text = value.trim();
+    if (!text) {
+      continue;
+    }
+    const coarse = text
+      .split(/[_\-\s,/\\|:;()（）【】\[\]]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    for (const token of coarse) {
+      if (token.length >= 2) {
+        tokens.add(token);
+      }
+    }
+    const zh = text.match(/[\u4e00-\u9fa5]{2,}/g) ?? [];
+    for (const token of zh) {
+      tokens.add(token);
+    }
+    const en = text.match(/[a-zA-Z][a-zA-Z0-9]{2,}/g) ?? [];
+    for (const token of en) {
+      tokens.add(token);
+    }
+  }
+  return Array.from(tokens).sort((a, b) => b.length - a.length);
+}
+
+function inferFieldRole(
+  field: LayerField,
+  objectIdField: string,
+  displayField: string
+): SemanticFieldRole {
+  const name = field.name.toLowerCase();
+  const alias = field.alias.toLowerCase();
+  const merged = `${name} ${alias}`;
+
+  if (
+    name === objectIdField.toLowerCase() ||
+    field.type === "esriFieldTypeOID" ||
+    /(objectid|fid|gid|编号|id)\b/i.test(merged)
+  ) {
+    return "id";
+  }
+  if (/(county|district|city|town|village|区县|行政|县级|城市|乡镇|街道|所在乡镇|乡级政区)/i.test(merged)) {
+    return "admin";
+  }
+  if (/(地址|标准地址|address|门牌)/i.test(merged)) {
+    return "address";
+  }
+  if (
+    /(shape__area|shape__length|面积|长度|周长|边长|area|length|perimeter)/i.test(merged) ||
+    ((field.type === "esriFieldTypeDouble" || field.type === "esriFieldTypeSingle") && /(面积|长度|area|length)/i.test(merged))
+  ) {
+    return "measure";
+  }
+  if (name === displayField.toLowerCase() || /(名称|标准名称|name|title)/i.test(merged)) {
+    return "name";
+  }
+  if (/(类型|类别|category|class|kind|民族)/i.test(merged)) {
+    return "category";
+  }
+  return "unknown";
+}
+
+async function buildSemanticProfile(
+  layerLike: Pick<LayerDescriptor, "name" | "aliases" | "fields" | "objectIdField" | "displayField" | "url">,
+  options?: { withValueHints?: boolean }
+): Promise<LayerSemanticProfile> {
+  const fieldRoles: LayerSemanticProfile["fieldRoles"] = {};
+  const adminFields: string[] = [];
+  const nameFields: string[] = [];
+  const categoryFields: string[] = [];
+  for (const field of layerLike.fields) {
+    if (!field.queryable) {
+      continue;
+    }
+    const role = inferFieldRole(field, layerLike.objectIdField, layerLike.displayField);
+    fieldRoles[field.name] = role;
+    if (role === "admin") {
+      adminFields.push(field.name);
+    } else if (role === "name") {
+      nameFields.push(field.name);
+    } else if (role === "category") {
+      categoryFields.push(field.name);
+    }
+  }
+
+  const valueHints: Record<string, string[]> = {};
+  if (options?.withValueHints) {
+    const candidates = Array.from(new Set([...adminFields, ...nameFields, ...categoryFields])).slice(0, MAX_SEMANTIC_HINT_FIELDS);
+    for (const fieldName of candidates) {
+      try {
+        const values = await queryDistinctFieldValues(layerLike.url, fieldName, MAX_SEMANTIC_HINT_VALUES);
+        if (values.length > 0) {
+          valueHints[fieldName] = values;
+        }
+      } catch {
+        // Ignore hint sampling failures to keep registration robust.
+      }
+    }
+  }
+
+  return {
+    tokens: splitSemanticTokens([layerLike.name, ...layerLike.aliases]),
+    fieldRoles,
+    adminFields,
+    nameFields,
+    valueHints: Object.keys(valueHints).length > 0 ? valueHints : undefined
+  };
+}
+
 export class LayerRegistry {
   private state: RegistryState = {
     version: 1,
@@ -155,6 +282,7 @@ export class LayerRegistry {
     }
 
     await this.loadFromDisk();
+    const migrated = await this.ensureSemanticProfiles();
     if (this.state.layers.length === 0) {
       try {
         await this.registerService(config.defaultParksLayerUrl);
@@ -163,6 +291,8 @@ export class LayerRegistry {
         this.state = this.buildFallbackState();
         await this.persist();
       }
+    } else if (migrated) {
+      await this.persist();
     }
     this.initialized = true;
   }
@@ -260,7 +390,7 @@ export class LayerRegistry {
           aliases.push("fuzhou_parks");
         }
 
-        layers.push({
+        const layer: LayerDescriptor = {
           layerKey: `${serviceId}:${layerDef.id}`,
           serviceId,
           layerId: layerDef.id,
@@ -276,7 +406,9 @@ export class LayerRegistry {
             : undefined,
           queryable: true,
           aliases: uniqueValues(aliases)
-        });
+        };
+        layer.semanticProfile = await buildSemanticProfile(layer, { withValueHints: true });
+        layers.push(layer);
       } catch (error) {
         console.warn(
           `[layer-registry] 子图层加载失败，已跳过: ${serviceUrl}/${layerDef.id}`,
@@ -432,10 +564,36 @@ export class LayerRegistry {
           visibleByDefault: true,
           pointRenderMode: "default",
           queryable: true,
-          aliases: ["fuzhou_parks", "福州市公园点", "公园"]
+          aliases: ["fuzhou_parks", "福州市公园点", "公园"],
+          semanticProfile: {
+            tokens: ["福州市公园点", "公园", "fuzhou", "parks"],
+            fieldRoles: {
+              fid: "id",
+              objectid: "id",
+              名称: "name",
+              地址: "address",
+              城市: "admin",
+              区县: "admin"
+            },
+            adminFields: ["城市", "区县"],
+            nameFields: ["名称"]
+          }
         }
       ]
     };
+  }
+
+  private async ensureSemanticProfiles(): Promise<boolean> {
+    let changed = false;
+    for (const layer of this.state.layers) {
+      const profile = layer.semanticProfile;
+      if (profile && Array.isArray(profile.tokens) && profile.tokens.length > 0) {
+        continue;
+      }
+      layer.semanticProfile = await buildSemanticProfile(layer, { withValueHints: false });
+      changed = true;
+    }
+    return changed;
   }
 }
 

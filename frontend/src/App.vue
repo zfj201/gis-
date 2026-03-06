@@ -30,6 +30,10 @@ interface ChatResponse {
     modelAttempts?: number;
     repaired?: boolean;
     decisionPath?: string;
+    gateDecision?: "spatial" | "non_spatial" | "uncertain";
+    candidateCount?: number;
+    chosenCandidate?: "model" | "rule" | "repaired_model";
+    candidateScore?: number;
   } | null;
 }
 
@@ -101,6 +105,7 @@ interface ChatMessage {
   id: number;
   role: "user" | "assistant";
   text: string;
+  followUpQuestion?: string | null;
   dsl?: Record<string, unknown>;
   queryPlan?: Record<string, unknown> | null;
   featureCount?: number;
@@ -129,6 +134,10 @@ interface ChatMessage {
     modelAttempts: number;
     repaired: boolean;
     decisionPath: string;
+    gateDecision?: "spatial" | "non_spatial" | "uncertain";
+    candidateCount?: number;
+    chosenCandidate?: "model" | "rule" | "repaired_model";
+    candidateScore?: number;
   } | null;
 }
 
@@ -799,6 +808,7 @@ async function runQuery(): Promise<void> {
     pushMessage({
       role: "assistant",
       text: parsed.summary || parsed.followUpQuestion || parsed.message || "已处理请求。",
+      followUpQuestion: parsed.followUpQuestion ?? null,
       dsl: (parsed.dsl as Record<string, unknown> | undefined) ?? undefined,
       queryPlan: parsed.queryPlan ?? null,
       featureCount: parsed.features?.length ?? 0,
@@ -821,10 +831,29 @@ async function runQuery(): Promise<void> {
       analysisMetaLines: analysisMetaLinesFromPlan(parsed.queryPlan ?? null),
       semanticMeta: parsed.semanticMeta
         ? {
+            // 统一在前端做一次类型归一化，避免后端可选字段导致模板判断抖动。
             retrievalHits: Number(parsed.semanticMeta.retrievalHits ?? 0),
             modelAttempts: Number(parsed.semanticMeta.modelAttempts ?? 0),
             repaired: Boolean(parsed.semanticMeta.repaired),
-            decisionPath: String(parsed.semanticMeta.decisionPath ?? "")
+            decisionPath: String(parsed.semanticMeta.decisionPath ?? ""),
+            gateDecision:
+              parsed.semanticMeta.gateDecision === "spatial" ||
+              parsed.semanticMeta.gateDecision === "non_spatial" ||
+              parsed.semanticMeta.gateDecision === "uncertain"
+                ? parsed.semanticMeta.gateDecision
+                : undefined,
+            candidateCount: Number.isFinite(Number(parsed.semanticMeta.candidateCount))
+              ? Number(parsed.semanticMeta.candidateCount)
+              : undefined,
+            chosenCandidate:
+              parsed.semanticMeta.chosenCandidate === "model" ||
+              parsed.semanticMeta.chosenCandidate === "rule" ||
+              parsed.semanticMeta.chosenCandidate === "repaired_model"
+                ? parsed.semanticMeta.chosenCandidate
+                : undefined,
+            candidateScore: Number.isFinite(Number(parsed.semanticMeta.candidateScore))
+              ? Number(parsed.semanticMeta.candidateScore)
+              : undefined
           }
         : null
     });
@@ -922,6 +951,24 @@ onBeforeUnmount(() => {
               链路：{{ message.semanticMeta.decisionPath || "unknown" }} · 检索样例
               {{ message.semanticMeta.retrievalHits }} · 模型尝试 {{ message.semanticMeta.modelAttempts }}
               <span v-if="message.semanticMeta.repaired">· 已修复</span>
+              <span v-if="typeof message.semanticMeta.candidateScore === 'number'">
+                · 候选评分 {{ message.semanticMeta.candidateScore.toFixed(1) }}
+              </span>
+              <span v-if="message.semanticMeta.chosenCandidate">
+                · 选中 {{ message.semanticMeta.chosenCandidate }}
+              </span>
+            </div>
+            <div
+              v-if="
+                message.role === 'assistant' &&
+                message.followUpQuestion &&
+                message.semanticMeta &&
+                typeof message.semanticMeta.candidateScore === 'number' &&
+                message.semanticMeta.candidateScore < 75
+              "
+              class="msg-warn"
+            >
+              低置信度，已进入澄清以避免误查。
             </div>
             <details
               v-if="message.role === 'assistant' && message.semanticWarnings && message.semanticWarnings.length > 0"
