@@ -1,9 +1,25 @@
 import type { LayerDescriptor } from "@gis/shared";
 import { config } from "../config.js";
+import type { RuleProfile } from "../analysis-dsl-v2.js";
 
 export interface PromptMessage {
   role: "system" | "user" | "assistant";
   content: string;
+}
+
+function compactRuleProfile(profile: RuleProfile): Record<string, unknown> {
+  return {
+    analysisFamily: profile.analysisFamily,
+    goal: profile.goal,
+    lockedOperators: profile.lockedOperators,
+    lockedOutputPolicy: profile.lockedOutputPolicy,
+    requiredSlots: profile.requiredSlots,
+    forbiddenMutations: profile.forbiddenMutations,
+    candidateLayers: profile.candidateLayers,
+    fieldHints: profile.fieldHints,
+    clarificationTriggers: profile.clarificationTriggers,
+    legacySeedDsl: profile.legacySeedDsl
+  };
 }
 
 function layerPromptBlock(layers: LayerDescriptor[]): string {
@@ -115,6 +131,24 @@ export function buildSemanticSystemPrompt(layers: LayerDescriptor[]): string {
     section4,
     section5,
     section6
+  ].join("\n");
+}
+
+export function buildRuleProfilePrompt(profile: RuleProfile): string {
+  return [
+    "【第7段：规则骨架】",
+    "本次问句已经由规则预判出分析骨架。你只能在允许的槽位内补全，不能改写骨架。",
+    JSON.stringify(compactRuleProfile(profile))
+  ].join("\n");
+}
+
+export function buildSemanticFillUserPrompt(question: string, profile: RuleProfile): string {
+  return [
+    `question: ${question}`,
+    "任务：基于上方 RuleProfile 输出最终 JSON。",
+    "只允许补全字段、操作符、值、filterExpr/sourceFilterExpr 以及必要的 sourceAttributeFilter。",
+    "禁止修改 lockedOperators、targetLayer、intent、aggregation.type、output.returnGeometry、spatialFilter.type。",
+    "如果规则骨架已经要求追问，则 actionable=false，并复用 followUpQuestion。"
   ].join("\n");
 }
 

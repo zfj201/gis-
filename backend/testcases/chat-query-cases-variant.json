@@ -408,5 +408,27 @@
       "requireQueryPlan": false,
       "allowFollowUp": true
     }
+  },
+  {
+    "id": "T-045",
+    "question": "以道路级别为维度汇总道路街巷数量",
+    "tags": [
+      "group_stat",
+      "field_dimension",
+      "rule_profile"
+    ]
+  },
+  {
+    "id": "T-046",
+    "question": "把区县范围内的道路街巷裁剪出来",
+    "tags": [
+      "overlay",
+      "clip",
+      "rule_profile"
+    ],
+    "expect": {
+      "requireQueryPlan": false,
+      "allowFollowUp": true
+    }
   }
 ]

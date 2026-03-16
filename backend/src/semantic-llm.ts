@@ -10,6 +10,8 @@ import { config } from "./config.js";
 import { layerRegistry } from "./layer-registry.js";
 import {
   buildSemanticFewShots,
+  buildRuleProfilePrompt,
+  buildSemanticFillUserPrompt,
   buildSemanticSystemPrompt,
   GENERAL_CHAT_SYSTEM_PROMPT
 } from "./prompts/semantic.js";
@@ -28,6 +30,13 @@ import {
 import { buildSemanticPromptContext } from "./semantic-context-builder.js";
 import { appendSemanticFailureRecord } from "./semantic-retrieval.js";
 import { rankSemanticCandidates, type SemanticCandidateLabel } from "./semantic-candidate-ranker.js";
+import {
+  buildRuleProfile,
+  buildRuleProfileFallbackResponse,
+  validateRuleProfileConsistency
+} from "./semantic-rule-profile.js";
+import { validateAnalysisDslOperators } from "./operator-registry.js";
+import { liftLegacyDslToAnalysisDslV2 } from "./analysis-dsl-adapter.js";
 
 interface LlmSemanticOutput {
   actionable: boolean;
@@ -1189,9 +1198,9 @@ function buildSemanticRepairPrompt(question: string, issue: SemanticOutputError)
 function buildSemanticMessages(
   semanticSystemPrompt: string,
   semanticFewShots: OpenAIMessage[],
-  question: string
+  userContent: string
 ): OpenAIMessage[] {
-  return [{ role: "system", content: semanticSystemPrompt }, ...semanticFewShots, { role: "user", content: question }];
+  return [{ role: "system", content: semanticSystemPrompt }, ...semanticFewShots, { role: "user", content: userContent }];
 }
 
 async function requestSemanticCompletion(
@@ -1297,7 +1306,8 @@ async function requestSemanticCompletion(
 function parseSemanticOutputToDsl(
   question: string,
   parserSource: "gemini" | "groq" | "openrouter",
-  rawContent: string
+  rawContent: string,
+  ruleProfile?: ReturnType<typeof buildRuleProfile>
 ): ParseResponse {
   const rawJson = extractJsonString(rawContent);
   let modelOutput: LlmSemanticOutput;
@@ -1316,6 +1326,41 @@ function parseSemanticOutputToDsl(
     parsed = normalizeModelOutput(question, modelOutput, parserSource);
   } catch (error) {
     throw new SemanticOutputError("schema", `模型输出 Schema 校验失败：${(error as Error).message}`, rawJson);
+  }
+
+  const ruleConflicts = ruleProfile ? validateRuleProfileConsistency(ruleProfile, parsed) : [];
+  if (ruleConflicts.length > 0 && config.semanticConsistencyStrict) {
+    throw new SemanticOutputError(
+      "consistency",
+      `模型输出与规则骨架冲突：${ruleConflicts.join("；")}`,
+      rawJson
+    );
+  }
+  if (ruleConflicts.length > 0 && !config.semanticConsistencyStrict) {
+    parsed = {
+      ...parsed,
+      semanticWarnings: [...(parsed.semanticWarnings ?? []), `模型输出与规则骨架存在偏差：${ruleConflicts.join("；")}`]
+    };
+  }
+
+  if (parsed.dsl) {
+    const operatorProblems = validateAnalysisDslOperators(liftLegacyDslToAnalysisDslV2(parsed.dsl));
+    if (operatorProblems.length > 0 && config.semanticConsistencyStrict) {
+      throw new SemanticOutputError(
+        "consistency",
+        `模型输出未通过算子一致性校验：${operatorProblems.join("；")}`,
+        rawJson
+      );
+    }
+    if (operatorProblems.length > 0 && !config.semanticConsistencyStrict) {
+      parsed = {
+        ...parsed,
+        semanticWarnings: [
+          ...(parsed.semanticWarnings ?? []),
+          `模型输出未通过算子一致性校验：${operatorProblems.join("；")}`
+        ]
+      };
+    }
   }
 
   if (!isModelResultConsistent(question, parsed) && config.semanticConsistencyStrict) {
@@ -1339,6 +1384,7 @@ function applyCandidateRanking(
   queryableLayers: LayerDescriptor[],
   modelParsed: ParseResponse,
   modelLabel: SemanticCandidateLabel,
+  ruleProfile: ReturnType<typeof buildRuleProfile>,
   contextMeta: {
     retrievalHits: number;
     modelAttempts: number;
@@ -1347,7 +1393,14 @@ function applyCandidateRanking(
     gateDecision: SpatialGateDecision;
   }
 ): ParseResponse {
-  const ruleParsed = withParserSource(parseQuestionByRules(question), "rule");
+  const baseRuleParsed = withParserSource(parseQuestionByRules(question), "rule");
+  const ruleParsed = ruleProfile.legacySeedDsl
+    ? {
+        ...baseRuleParsed,
+        dsl: ruleProfile.legacySeedDsl,
+        followUpQuestion: ruleProfile.followUpQuestion
+      }
+    : baseRuleParsed;
   const ranked = rankSemanticCandidates(
     question,
     [
@@ -1399,6 +1452,16 @@ async function parseWithOpenAICompatible(
 
   const catalog = layerRegistry.listCatalog();
   const queryableLayers = catalog.layers.filter((layer) => layer.queryable);
+  const ruleProfile = buildRuleProfile(question);
+  if (!ruleProfile.actionable) {
+    return withSemanticMeta(buildRuleProfileParsed(question, "rule"), {
+      retrievalHits: 0,
+      modelAttempts: 0,
+      repaired: false,
+      decisionPath: "rule_profile_short_circuit",
+      gateDecision: computeSpatialGate(question).decision
+    });
+  }
   const defaultLayerKey = layerRegistry.getDefaultLayer()?.layerKey ?? "fuzhou_parks";
   const context = await buildSemanticPromptContext({
     question,
@@ -1407,13 +1470,18 @@ async function parseWithOpenAICompatible(
   });
   const semanticSystemPrompt = [
     buildSemanticSystemPrompt(queryableLayers),
+    buildRuleProfilePrompt(ruleProfile),
     context.retrievalSystemHint
   ]
     .filter((item) => item && item.trim().length > 0)
     .join("\n\n");
   const baseFewShots = buildSemanticFewShots(defaultLayerKey, queryableLayers);
   const semanticFewShots = [...context.retrievalFewShots, ...baseFewShots].slice(0, 24);
-  const baseMessages = buildSemanticMessages(semanticSystemPrompt, semanticFewShots, question);
+  const baseMessages = buildSemanticMessages(
+    semanticSystemPrompt,
+    semanticFewShots,
+    buildSemanticFillUserPrompt(question, ruleProfile)
+  );
   const deadlineAt = options?.deadlineAt ?? Date.now() + 55_000;
   const maxRepairRetry = Math.max(0, config.semanticModelRepairMaxRetry);
   const gateDecision = computeSpatialGate(question).decision;
@@ -1423,8 +1491,8 @@ async function parseWithOpenAICompatible(
   modelAttempts += first.attemptsUsed;
 
   try {
-    const parsed = parseSemanticOutputToDsl(question, provider.parserSource, first.content);
-    return applyCandidateRanking(question, queryableLayers, parsed, "model", {
+    const parsed = parseSemanticOutputToDsl(question, provider.parserSource, first.content, ruleProfile);
+    return applyCandidateRanking(question, queryableLayers, parsed, "model", ruleProfile, {
       retrievalHits: context.retrievalHits,
       modelAttempts,
       repaired,
@@ -1462,8 +1530,13 @@ async function parseWithOpenAICompatible(
       previousContent = repairedCompletion.content;
 
       try {
-        const parsed = parseSemanticOutputToDsl(question, provider.parserSource, repairedCompletion.content);
-        return applyCandidateRanking(question, queryableLayers, parsed, "repaired_model", {
+        const parsed = parseSemanticOutputToDsl(
+          question,
+          provider.parserSource,
+          repairedCompletion.content,
+          ruleProfile
+        );
+        return applyCandidateRanking(question, queryableLayers, parsed, "repaired_model", ruleProfile, {
           retrievalHits: context.retrievalHits,
           modelAttempts,
           repaired,
@@ -2026,6 +2099,42 @@ export async function summarizeSpatialResultStream(
   throw new Error(`LLM_PROVIDER=${provider} 不支持流式摘要`);
 }
 
+function buildRuleProfileParsed(question: string, parserSource: ParserSource): ParseResponse {
+  const profile = buildRuleProfile(question);
+  const fallback = buildRuleProfileFallbackResponse(profile);
+  if (fallback) {
+    return {
+      ...fallback,
+      parserSource
+    };
+  }
+
+  if (profile.followUpQuestion) {
+    const placeholder = withParserSource(parseQuestionByRules(question), parserSource);
+    return {
+      ...placeholder,
+      followUpQuestion: profile.followUpQuestion,
+      semanticWarnings: Array.from(
+        new Set([...(placeholder.semanticWarnings ?? []), "规则骨架已识别该分析，但当前仍需澄清或等待执行器支持。"])
+      )
+    };
+  }
+
+  if (profile.legacySeedDsl) {
+    return {
+      dsl: profile.legacySeedDsl,
+      confidence: 0.9,
+      followUpQuestion: profile.followUpQuestion,
+      parserSource,
+      semanticWarnings: profile.analysisFamily === "overlay"
+        ? ["已识别为叠加分析骨架，当前仅输出规则追问。"]
+        : undefined
+    };
+  }
+
+  return withParserSource(parseQuestionByRules(question), parserSource);
+}
+
 export async function isSpatialQuestion(question: string): Promise<boolean> {
   const decision = await detectSpatialIntentDecision(question.trim());
   console.info("[semantic-gate] decision", {
@@ -2063,7 +2172,7 @@ export async function parseQuestionSmart(
 
   const provider = config.llmProvider.trim().toLowerCase();
   if (provider === "rule") {
-    return withSemanticMeta(withParserSource(parseQuestionByRules(question), "rule"), {
+    return withSemanticMeta(buildRuleProfileParsed(question, "rule"), {
       retrievalHits: 0,
       modelAttempts: 0,
       repaired: false,
@@ -2089,7 +2198,7 @@ export async function parseQuestionSmart(
         detail,
         isFallback: true
       });
-      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      const fallback = buildRuleProfileParsed(question, "rule_fallback");
       await appendSemanticFailureRecord({
         question,
         parserFailureReason: reason,
@@ -2137,7 +2246,7 @@ export async function parseQuestionSmart(
         detail,
         isFallback: true
       });
-      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      const fallback = buildRuleProfileParsed(question, "rule_fallback");
       await appendSemanticFailureRecord({
         question,
         parserFailureReason: reason,
@@ -2177,7 +2286,7 @@ export async function parseQuestionSmart(
         detail,
         isFallback: true
       });
-      const fallback = withParserSource(parseQuestionByRules(question), "rule_fallback");
+      const fallback = buildRuleProfileParsed(question, "rule_fallback");
       await appendSemanticFailureRecord({
         question,
         parserFailureReason: reason,
@@ -2201,7 +2310,7 @@ export async function parseQuestionSmart(
   }
 
   console.warn(`[semantic] 未识别的 LLM_PROVIDER=${provider}，已回退规则解析`);
-  return withSemanticMeta(withParserSource(parseQuestionByRules(question), "rule"), {
+  return withSemanticMeta(buildRuleProfileParsed(question, "rule"), {
     retrievalHits: 0,
     modelAttempts: 0,
     repaired: false,

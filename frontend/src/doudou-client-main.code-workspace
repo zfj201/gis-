@@ -5,6 +5,15 @@
 		},
 		{
 			"path": "../.."
+		},
+		{
+			"path": "../../../doudou-app-h5"
+		},
+		{
+			"path": "../../../robust-testing"
+		},
+		{
+			"path": "../../../huobanai"
 		}
 	],
 	"settings": {}
